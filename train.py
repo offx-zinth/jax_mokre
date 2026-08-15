@@ -94,6 +94,11 @@ def load_state(path):
         return pickle.load(f)
 
 
+def _first(p):
+    """pmap leaves with out_axes=(None, ...) are already single-device (replicated)."""
+    return p
+
+
 def schedule(step, lr, lr_min, warmup, total):
     if step < warmup:
         return lr * (step + 1) / warmup
@@ -247,9 +252,10 @@ def main():
     def sample(step_):
         ids = tokenizer.encode(args.gen_prompt, add_special_tokens=False)
         ids = np.asarray(ids[:16], dtype=np.int32)[None, :]
+        gen_params = params
         out = list(ids[0])
         for _ in range(args.gen_len):
-            nxt = np.asarray(gen_fn(params, ids))
+            nxt = np.asarray(gen_fn(gen_params, ids))
             out.append(int(nxt[0]))
             ids = np.concatenate([ids, nxt[:, None]], axis=1)[:, -cfg.max_seq_len:]
         text = tokenizer.decode(out)
@@ -293,8 +299,8 @@ def main():
 
         if step % args.ckpt_every == 0:
             save_state(os.path.join(args.out_dir, f"ckpt_{step}.pkl"), cfg,
-                       params if not dist else params[0],
-                       opt_state if not dist else opt_state[0], step, rng)
+                       params,
+                       opt_state, step, rng)
 
         if step % args.gen_every == 0:
             sample(step)
@@ -303,8 +309,8 @@ def main():
             break
 
     save_state(os.path.join(args.out_dir, "final.pkl"), cfg,
-               params if not dist else params[0],
-               opt_state if not dist else opt_state[0], step, rng)
+               params,
+               opt_state, step, rng)
     print(f"Done. {step} steps. final avg loss (last 50): {np.mean(losses[-50:]):.4f}")
 
 
