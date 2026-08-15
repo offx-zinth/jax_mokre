@@ -124,9 +124,9 @@ def test_train_steps():
     cfg = tinystories()
     cfg.max_seq_len = 128
     params = M.init_model(cfg, jax.random.PRNGKey(6))
-    from transformers import AutoTokenizer
+    from transformers import GPT2TokenizerFast
     from . import data as D
-    tokenizer = AutoTokenizer.from_pretrained("gpt2")
+    tokenizer = GPT2TokenizerFast.from_pretrained("gpt2")
     tokens = D.ensure_tokens("train", tokenizer, "/tmp/tinystories_smoke",
                              max_files=1, max_stories=2000, force=False)
     it = D.make_iter(tokens, 4, 64)

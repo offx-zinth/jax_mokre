@@ -195,8 +195,8 @@ def main():
     step_fn = make_train_step(cfg, opt, args.ce_chunk, dist)
     gen_fn = make_gen_step(cfg)
 
-    from transformers import AutoTokenizer
-    tokenizer = AutoTokenizer.from_pretrained("gpt2")
+    from transformers import GPT2TokenizerFast
+    tokenizer = GPT2TokenizerFast.from_pretrained("gpt2")
 
     if args.synthetic:
         rngd = np.random.default_rng(args.seed)
