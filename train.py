@@ -64,7 +64,7 @@ def make_train_step(cfg, opt, ce_chunk, dist, remat=True):
     if dist:
         return jax.pmap(step, axis_name="batch",
                         in_axes=(None, None, 0, 0, None),
-                        out_axes=(None, None, None, None, None))
+                        out_axes=(None, None, 0, 0, 0))
     return jax.jit(step)
 
 
@@ -272,7 +272,7 @@ def main():
 
         params, opt_state, loss, ce, aux = step_fn(params, opt_state, x, y, lr)
 
-        loss_v = float(np.asarray(loss)) if not dist else float(np.asarray(loss[0]))
+        loss_v = float(np.asarray(loss).mean())
         if np.isfinite(loss_v):
             last_good = (params, opt_state)
         else:
@@ -287,7 +287,7 @@ def main():
 
         if step % args.log_every == 0 or step == start_step + 1:
             tok_per_s = step_tokens / max(time.time() - t0, 1e-6)
-            log(step, loss_v, float(np.asarray(aux)) if not dist else float(np.asarray(aux[0])),
+            log(step, loss_v, float(np.asarray(aux).mean()),
                 lr, tok_per_s)
             t0 = time.time()
 
