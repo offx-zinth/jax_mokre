@@ -103,3 +103,44 @@ def make_iter(tokens: np.ndarray, batch_size: int, seq_len: int, rng=None):
         x = seg[:-1].reshape(batch_size, seq_len).astype(np.int32)
         y = seg[1:].reshape(batch_size, seq_len).astype(np.int32)
         yield x, y
+
+
+def ensure_shards(split: str, tokenizer, data_dir: str, *, max_files: int | None = None,
+                  max_stories: int | None = None, force: bool = False) -> list[np.ndarray]:
+    """Tokenize TinyStories **one parquet shard at a time**, returning per-shard
+    uint16 arrays (memory-mapped). Peak host memory ~= one shard, not the corpus."""
+    os.makedirs(data_dir, exist_ok=True)
+    paths = _download(split, data_dir, max_files)
+    print(f"Tokenizing {split} shard-by-shard ({len(paths)} shard(s))...")
+    shards: list[np.ndarray] = []
+    for i, p in enumerate(paths):
+        cache = os.path.join(data_dir, f"{split}_shard{i}.npy")
+        if os.path.exists(cache) and not force:
+            arr = np.load(cache, mmap_mode="r")
+            print(f"  {os.path.basename(p)}: cached {arr.shape[0]:,} tokens")
+        else:
+            nrows = pq.read_metadata(p).num_rows
+            cap = nrows * 400 + 1_000_000
+            arr = np.empty(cap, dtype=np.uint16)
+            pos, stories = _tokenize_shard(p, tokenizer, max_stories, arr, 0)
+            arr = arr[:pos]
+            np.save(cache, arr)
+            print(f"  {os.path.basename(p)}: tokenized {pos:,} tokens, "
+                  f"{stories} stories")
+        shards.append(arr)
+    return shards
+
+
+def stream_iter(shards: list[np.ndarray], batch_size: int, seq_len: int,
+                steps_per_shard: int, rng=None):
+    """Infinite generator: cycles shards (shuffled order each pass), drawing
+    random-offset batches from ONE shard at a time for `steps_per_shard` steps."""
+    if rng is None:
+        rng = np.random.default_rng(0)
+    order = rng.permutation(len(shards))
+    while True:
+        for idx in order:
+            it = make_iter(shards[idx], batch_size, seq_len, rng)
+            for _ in range(steps_per_shard):
+                yield next(it)
+        order = rng.permutation(len(shards))

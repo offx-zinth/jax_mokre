@@ -38,16 +38,20 @@ def chunked_ce(cfg, Wt, hidden, labels, chunk):
     return sum(losses) / len(losses)
 
 
-def make_loss_fn(cfg, ce_chunk):
+def make_loss_fn(cfg, ce_chunk, remat):
+    def _fwd(params, x):
+        return M.forward(cfg, params, x, training=True, return_hidden=True)
+    fwd = jax.remat(_fwd) if remat else _fwd
+
     def loss_fn(params, x, y):
-        hidden, aux, _ = M.forward(cfg, params, x, training=True, return_hidden=True)
+        hidden, aux, _ = fwd(params, x)
         ce = chunked_ce(cfg, params["embed_tokens"], hidden, y, ce_chunk)
         return ce + aux, (ce, aux)
     return loss_fn
 
 
-def make_train_step(cfg, opt, ce_chunk, dist):
-    loss_fn = make_loss_fn(cfg, ce_chunk)
+def make_train_step(cfg, opt, ce_chunk, dist, remat=True):
+    loss_fn = make_loss_fn(cfg, ce_chunk, remat)
 
     def step(params, opt_state, x, y, lr):
         (loss, (ce, aux)), grads = jax.value_and_grad(loss_fn, has_aux=True)(params, x, y)
@@ -150,7 +154,11 @@ def main():
     ap.add_argument("--max_files", type=int, default=None)
     ap.add_argument("--max_stories", type=int, default=None)
     ap.add_argument("--max_tokens", type=int, default=None)
+    ap.add_argument("--stream", action="store_true",
+                    help="process the dataset one parquet shard at a time (peak RAM = 1 shard)")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--no-remat", action="store_true",
+                    help="disable gradient rematerialization (default: on, bounds HBM)")
     ap.add_argument("--resume", type=str, default=None)
     ap.add_argument("--synthetic", action="store_true")
     args = ap.parse_args()
@@ -192,7 +200,7 @@ def main():
     if opt_state is None:
         opt_state = opt.init(params)
 
-    step_fn = make_train_step(cfg, opt, args.ce_chunk, dist)
+    step_fn = make_train_step(cfg, opt, args.ce_chunk, dist, remat=not args.no_remat)
     gen_fn = make_gen_step(cfg)
 
     from transformers import GPT2TokenizerFast
@@ -204,11 +212,23 @@ def main():
         data_iter = D.make_iter(tokens, args.batch_size, args.seq_len)
         print("Dataset: synthetic")
     else:
-        tokens = D.ensure_tokens(args.split, tokenizer, args.data_dir,
-                                 max_files=args.max_files, max_stories=args.max_stories,
-                                 max_tokens=args.max_tokens)
-        data_iter = D.make_iter(tokens, args.batch_size, args.seq_len)
-        print(f"Dataset: {args.split} tokens={tokens.shape[0]:,}")
+        if args.stream:
+            shards = D.ensure_shards(args.split, tokenizer, args.data_dir,
+                                     max_files=args.max_files,
+                                     max_stories=args.max_stories)
+            n_shards = len(shards)
+            steps_per_shard = max(int(np.ceil(args.total_steps / n_shards)), 1)
+            data_iter = D.stream_iter(shards, args.batch_size, args.seq_len,
+                                      steps_per_shard)
+            print(f"Dataset: {args.split} streamed across {n_shards} shard(s), "
+                  f"{steps_per_shard} steps/shard")
+        else:
+            tokens = D.ensure_tokens(args.split, tokenizer, args.data_dir,
+                                     max_files=args.max_files,
+                                     max_stories=args.max_stories,
+                                     max_tokens=args.max_tokens)
+            data_iter = D.make_iter(tokens, args.batch_size, args.seq_len)
+            print(f"Dataset: {args.split} tokens={tokens.shape[0]:,}")
 
     per = max(args.batch_size // len(devices), 1)
     step_tokens = per * args.seq_len * len(devices)
