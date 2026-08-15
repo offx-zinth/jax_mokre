@@ -31,19 +31,28 @@ def _download(split: str, data_dir: str, max_files: int | None) -> list[str]:
     return paths
 
 
-def _tokenize_shard(path: str, tokenizer, target: int | None, buf: list[int]) -> int:
-    """Append GPT-2 tokens of one parquet shard to buf. Returns token count."""
+def _tokenize_shard(path: str, tokenizer, target: int | None,
+                    arr: np.ndarray, pos: int) -> tuple[int, int]:
+    """Batch-encode one parquet shard into arr[pos:]; returns (new pos, stories)."""
     nl = tokenizer.encode("\n", add_special_tokens=False)[0]
     table = pq.read_table(path, columns=["text"])
     texts = table["text"].to_pylist()
-    total = 0
-    for text in texts:
-        buf.extend(tokenizer.encode(text, add_special_tokens=False))
-        buf.append(nl)
-        total += 1
-        if target is not None and total >= target:
-            break
-    return total
+    bs = 512
+    stories = 0
+    for i in range(0, len(texts), bs):
+        enc = tokenizer(texts[i:i + bs], add_special_tokens=False)["input_ids"]
+        for ids in enc:
+            n = len(ids)
+            if pos + n + 1 > arr.shape[0]:
+                return pos, stories
+            arr[pos:pos + n] = np.asarray(ids, dtype=np.uint16)
+            pos += n
+            arr[pos] = nl
+            pos += 1
+            stories += 1
+            if target is not None and stories >= target:
+                return pos, stories
+    return pos, stories
 
 
 def ensure_tokens(split: str, tokenizer, data_dir: str, *, max_files: int | None = None,
@@ -59,14 +68,20 @@ def ensure_tokens(split: str, tokenizer, data_dir: str, *, max_files: int | None
 
     paths = _download(split, data_dir, max_files)
     print(f"Tokenizing {split} ({len(paths)} shard(s)) with GPT-2...")
-    buf: list[int] = []
+    total_rows = sum(pq.read_metadata(p).num_rows for p in paths)
+
+    cap = max_tokens if max_tokens else total_rows * 400 + 1_000_000
+    arr = np.empty(cap, dtype=np.uint16)
+    pos = 0
     stories = 0
     for p in paths:
-        n = _tokenize_shard(p, tokenizer, max_stories, buf)
-        stories += n
-        print(f"  {os.path.basename(p)}: {n} stories, {len(buf):,} tokens so far")
+        before = pos
+        pos, n_stories = _tokenize_shard(p, tokenizer, max_stories, arr, pos)
+        stories += n_stories
+        print(f"  {os.path.basename(p)}: +{pos - before:,} tokens "
+              f"({pos:,} total so far)")
 
-    tokens = np.asarray(buf, dtype=np.uint16)
+    tokens = arr[:pos]
     if max_tokens is not None:
         tokens = tokens[:max_tokens]
     np.save(cache, tokens)
