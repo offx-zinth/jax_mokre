@@ -122,10 +122,10 @@ def build_config(args) -> MoREConfig:
         )
     else:
         cfg = MoREConfig(
-            vocab_size=50257, hidden_size=640, intermediate_size=1024,
-            num_attention_heads=10, num_key_value_heads=5, head_dim=64,
-            max_seq_len=args.seq_len, max_recursion_depth=2,
-            num_experts=4, num_local_experts=4, num_shared_experts=1, top_k=2,
+            vocab_size=50257, hidden_size=1024, intermediate_size=1024,
+            num_attention_heads=16, num_key_value_heads=8, head_dim=64,
+            max_seq_len=args.seq_len, max_recursion_depth=4,
+            num_experts=8, num_local_experts=8, num_shared_experts=1, top_k=2,
             router_hidden_size=128, kda_state_size=64, kda_chunk_size=16,
             layer_types=["kda", "kda", "mla", "kda"],
             load_balancing_loss_coef=args.aux_coef, rms_norm_eps=1e-6,
