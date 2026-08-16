@@ -14,6 +14,8 @@ instead of the torch Python loop.
 
 from __future__ import annotations
 
+import math
+
 import jax
 import jax.numpy as jnp
 from .config import MoREConfig
@@ -171,6 +173,50 @@ def init_moe(cfg, key):
     }
 
 
+def _grouped_topk(cfg, p, xf, topk_idx, w):
+    """Sparse top-k MoE via a single combined grouping over all k·N
+    (token, expert) entries.
+
+    Entries are flattened to (N·k,), sorted by selected expert, and computed
+    as one padded (E, G, H) batched matmul, so each token is routed through
+    exactly its k chosen experts and no other. Total compute ≈ E·G units with
+    G = ⌈k·N/E · cap⌉, which is `k·cap/E` of the dense E·N — real savings even
+    at E=4, top-k=2 (cap=1.25 → 37% less). G depends only on static shapes,
+    so it stays concrete under jit. Overflow entries (expert got > G tokens)
+    are dropped (standard MoE capacity overflow) and receive only the shared
+    expert; the load-balancing aux loss keeps overflow rare."""
+    H = xf.shape[1]
+    E = p["expert_gate_w"].shape[0]
+    N, k = topk_idx.shape
+    Nk = N * k
+
+    e_all = topk_idx.reshape(-1)                       # (Nk,) selected expert
+    w_all = w.reshape(-1)                              # (Nk,) routing weight
+    tok_all = jnp.repeat(jnp.arange(N), k)               # (Nk,) which token
+
+    order = jnp.argsort(e_all, stable=True)            # (Nk,)
+    counts = jnp.bincount(e_all[order], length=E)      # (E,)
+    G = min(math.ceil(Nk / E * cfg.capacity_factor), Nk)
+    G = max(G, 1)
+    starts = jnp.concatenate([jnp.zeros((1,), jnp.int32),
+                              jnp.cumsum(counts)[:-1]])  # (E,)
+    ar = jnp.arange(G)[None, :]
+    keep = (ar < jnp.minimum(counts, G)[:, None]).astype(xf.dtype)  # (E,G)
+    gidx = starts[:, None] + jnp.minimum(ar, counts[:, None] - 1)   # (E,G) sorted order
+
+    xg = xf[tok_all][order][gidx] * keep[..., None]     # (E,G,H)
+    wg = w_all[order][gidx] * keep                      # (E,G)
+    gate = jnp.einsum("egh,emh->egm", xg, p["expert_gate_w"])   # (E,G,M)
+    up = jnp.einsum("egh,emh->egm", xg, p["expert_up_w"])
+    act = jax.nn.silu(gate) * up
+    down = jnp.einsum("egm,ehm->egh", act, p["expert_down_w"])    # (E,G,H)
+
+    # scatter into sorted-entry space, back to entry order, per-token sum
+    routed_sorted = jnp.zeros((Nk, H)).at[gidx].add(down * wg[..., None])
+    routed_entry = routed_sorted[jnp.argsort(order)]   # (Nk,H) entry order
+    return routed_entry.reshape(N, k, H).sum(axis=1)   # (N,H)
+
+
 def moe_forward(cfg, p, x, training=False):
     B, S, H = x.shape
     E, M, k = p["expert_gate_w"].shape[0], p["expert_gate_w"].shape[1], cfg.top_k
@@ -188,15 +234,11 @@ def moe_forward(cfg, p, x, training=False):
     w_e = jnp.sum(jnp.where(topk_idx[..., None] == jnp.arange(E), w[..., None], 0.0),
                   axis=1)                               # (N,E)
 
-    # experts applied one at a time (same FLOPs as a batched einsum, but only
-    # one (N,M) intermediate lives at a time — keeps TPU HBM usage low)
-    routed = jnp.zeros_like(xf)
-    for e in range(E):
-        gate = xf @ p["expert_gate_w"][e].T
-        up = xf @ p["expert_up_w"][e].T
-        act = jax.nn.silu(gate) * up
-        down = act @ p["expert_down_w"][e].T
-        routed = routed + w_e[:, e:e + 1] * down
+    # Sparse top-k: each token is routed through exactly its k chosen experts
+    # via a single padded (E, G, H) grouped matmul (see _grouped_topk). This
+    # computes k·cap/E of the dense E·N routed FLOPs — real savings even at
+    # E=4/top-k=2 — while every token still touches only its k experts.
+    routed = _grouped_topk(cfg, p, xf, topk_idx, w)
 
     sgate = jax.nn.silu(xf @ p["shared_gate_w"].T)
     sup = xf @ p["shared_up_w"].T

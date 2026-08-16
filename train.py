@@ -122,11 +122,11 @@ def build_config(args) -> MoREConfig:
         )
     else:
         cfg = MoREConfig(
-            vocab_size=50257, hidden_size=768, intermediate_size=2048,
-            num_attention_heads=12, num_key_value_heads=4, head_dim=64,
-            max_seq_len=args.seq_len, max_recursion_depth=4,
-            num_experts=8, num_local_experts=8, num_shared_experts=1, top_k=2,
-            router_hidden_size=128, kda_state_size=64, kda_chunk_size=32,
+            vocab_size=50257, hidden_size=640, intermediate_size=1024,
+            num_attention_heads=10, num_key_value_heads=5, head_dim=64,
+            max_seq_len=args.seq_len, max_recursion_depth=2,
+            num_experts=4, num_local_experts=4, num_shared_experts=1, top_k=2,
+            router_hidden_size=128, kda_state_size=64, kda_chunk_size=16,
             layer_types=["kda", "kda", "mla", "kda"],
             load_balancing_loss_coef=args.aux_coef, rms_norm_eps=1e-6,
             initializer_range=0.02,
@@ -166,6 +166,10 @@ def main():
                     help="disable gradient rematerialization (default: on, bounds HBM)")
     ap.add_argument("--resume", type=str, default=None)
     ap.add_argument("--synthetic", action="store_true")
+    ap.add_argument("--fineweb", action="store_true",
+                    help="train on local FineWeb-Edu parquet (--fineweb_source)")
+    ap.add_argument("--fineweb_source", type=str, default=None,
+                    help="folder containing fineweb-edu-dedup-10b train-*.parquet")
     args = ap.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
@@ -211,7 +215,19 @@ def main():
     from transformers import GPT2TokenizerFast
     tokenizer = GPT2TokenizerFast.from_pretrained("gpt2")
 
-    if args.synthetic:
+    if args.fineweb:
+        if not args.fineweb_source:
+            raise SystemExit("--fineweb requires --fineweb_source=<folder of train-*.parquet>")
+        shards = D.ensure_fineweb_shards(tokenizer, args.data_dir,
+                                         args.fineweb_source,
+                                         max_shards=args.max_files)
+        n_shards = len(shards)
+        steps_per_shard = max(int(np.ceil(args.total_steps / n_shards)), 1)
+        data_iter = D.stream_iter(shards, args.batch_size, args.seq_len,
+                                  steps_per_shard)
+        print(f"Dataset: FineWeb-Edu streamed across {n_shards} shard(s), "
+              f"{steps_per_shard} steps/shard")
+    elif args.synthetic:
         rngd = np.random.default_rng(args.seed)
         tokens = rngd.integers(0, cfg.vocab_size, size=100_000, dtype=np.uint16)
         data_iter = D.make_iter(tokens, args.batch_size, args.seq_len)

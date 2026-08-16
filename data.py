@@ -144,3 +144,78 @@ def stream_iter(shards: list[np.ndarray], batch_size: int, seq_len: int,
             for _ in range(steps_per_shard):
                 yield next(it)
         order = rng.permutation(len(shards))
+
+# ---------------------------------------------------------------------------
+# FineWeb-Edu loader (EleutherAI/fineweb-edu-dedup-10b style).
+# Works with the local subset parquet file(s) already downloaded; each shard is
+# tokenized once to a uint16 npy cache and streamed shard-by-shard exactly like
+# the TinyStories path, so peak host RAM stays ~one shard.
+
+REPO_FINEWEB = "EleutherAI/fineweb-edu-dedup-10b"
+
+
+def fineweb_parquets(path: str | os.PathLike) -> list[str]:
+    """Return all *.parquet under a local dir (recursively), sorted."""
+    import glob as _glob
+    return sorted(_glob.glob(os.path.join(str(path), "**", "*.parquet"), recursive=True))
+
+
+def _tokenize_texts(texts, tokenizer, arr, pos, nl):
+    bs = 512
+    for i in range(0, len(texts), bs):
+        enc = tokenizer(texts[i:i + bs], add_special_tokens=False)["input_ids"]
+        for ids in enc:
+            n = len(ids)
+            if pos + n + 1 > arr.shape[0]:
+                return pos
+            arr[pos:pos + n] = np.asarray(ids, dtype=np.uint16)
+            pos += n
+            arr[pos] = nl
+            pos += 1
+    return pos
+
+
+def ensure_fineweb_shards(tokenizer, data_dir: str,
+                          source: str | os.PathLike,
+                          *, max_shards: int | None = None,
+                          force: bool = False) -> list[np.ndarray]:
+    """Tokenize local FineWeb-Edu parquet shards one at a time -> npy caches.
+    `source` is the local folder containing train-*.parquet."""
+    os.makedirs(data_dir, exist_ok=True)
+    paths = fineweb_parquets(source)
+    if max_shards:
+        paths = paths[:max_shards]
+    nl = tokenizer.encode("\n", add_special_tokens=False)[0]
+    print(f"FineWeb-Edu: {len(paths)} shard(s) under {source}")
+    shards: list[np.ndarray] = []
+    for i, p in enumerate(paths):
+        cache = os.path.join(data_dir, f"fineweb_shard{i}.npy")
+        if os.path.exists(cache) and not force:
+            arr = np.load(cache, mmap_mode="r")
+            print(f"  {os.path.basename(p)}: cached {arr.shape[0]:,} tokens")
+        else:
+            nrows = pq.read_metadata(p).num_rows
+            cap = nrows * 400 + 1_000_000
+            arr = np.empty(cap, dtype=np.uint16)
+            pos = 0
+            table = pq.read_table(p, columns=["text"])
+            texts = table["text"].to_pylist()
+            bs = 512
+            for i2 in range(0, len(texts), bs):
+                enc = tokenizer(texts[i2:i2 + bs], add_special_tokens=False)["input_ids"]
+                for ids in enc:
+                    n = len(ids)
+                    if pos + n + 1 > arr.shape[0]:
+                        break
+                    arr[pos:pos + n] = np.asarray(ids, dtype=np.uint16)
+                    pos += n
+                    arr[pos] = nl
+                    pos += 1
+                else:
+                    continue
+                break
+            arr = arr[:pos]
+            np.save(cache, arr)
+            print(f"  {os.path.basename(p)}: tokenized {pos:,} tokens")
+        shards.append(arr)
+    return shards
