@@ -279,10 +279,18 @@ def router_forward(cfg, p, x, training=False):
     probs = jax.nn.softmax(logits, axis=-1)
     depths = jnp.argmax(probs, axis=-1) + 1             # 1..Nr
     if training:
+        # load-balancing: keep every depth populated (uniform-ish usage)
         oh = jax.nn.one_hot(depths - 1, Nr).astype(x.dtype)
         f = (Nr / (B * S)) * oh.sum(axis=(0, 1))
         P = probs.mean(axis=(0, 1))
-        aux = coef * jnp.sum(f * P)
+        aux_lb = coef * jnp.sum(f * P)
+        # depth-push: encourage DEEPER recursion so the shared block is actually
+        # reused. Penalize expected-depth shortfall vs Nr. This is what makes the
+        # MoR head learn to benefit from looping (empirically it underuses depth).
+        dvec = jnp.arange(1, Nr + 1).astype(x.dtype)
+        exp_depth = jnp.sum(probs * dvec, axis=-1).mean()   # avg chosen depth
+        aux_push = cfg.recursion_aux_coef * jnp.maximum(Nr - exp_depth, 0.0)
+        aux = aux_lb + aux_push
     else:
         aux = 0.0
     return depths, aux

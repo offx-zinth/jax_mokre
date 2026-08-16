@@ -117,7 +117,8 @@ def build_config(args) -> MoREConfig:
             num_experts=8, num_local_experts=8, num_shared_experts=1, top_k=1,
             router_hidden_size=64, kda_state_size=64, kda_chunk_size=16,
             layer_types=["kda", "kda", "mla", "kda"],
-            load_balancing_loss_coef=args.aux_coef, rms_norm_eps=1e-6,
+            load_balancing_loss_coef=args.aux_coef, recursion_aux_coef=args.rec_aux_coef,
+            rms_norm_eps=1e-6,
             initializer_range=0.02,
         )
     else:
@@ -128,7 +129,8 @@ def build_config(args) -> MoREConfig:
             num_experts=8, num_local_experts=8, num_shared_experts=1, top_k=2,
             router_hidden_size=128, kda_state_size=64, kda_chunk_size=16,
             layer_types=["kda", "kda", "mla", "kda"],
-            load_balancing_loss_coef=args.aux_coef, rms_norm_eps=1e-6,
+            load_balancing_loss_coef=args.aux_coef, recursion_aux_coef=args.rec_aux_coef,
+            rms_norm_eps=1e-6,
             initializer_range=0.02,
         )
     return cfg
@@ -147,6 +149,8 @@ def main():
     ap.add_argument("--weight_decay", type=float, default=0.01)
     ap.add_argument("--accum", type=int, default=4)
     ap.add_argument("--aux_coef", type=float, default=0.01)
+    ap.add_argument("--rec_aux_coef", type=float, default=0.1,
+                    help="recursion depth-push aux: pushes router toward deeper loops")
     ap.add_argument("--ce_chunk", type=int, default=32)
     ap.add_argument("--log_every", type=int, default=1)
     ap.add_argument("--ckpt_every", type=int, default=1000)

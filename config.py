@@ -26,6 +26,7 @@ class MoREConfig:
 
     router_hidden_size: int = 64
     load_balancing_loss_coef: float = 0.01
+    recursion_aux_coef: float = 0.1   # pushes router toward deeper recursion
     capacity_factor: float = 1.25
 
     num_experts: int = 8           # routed experts
