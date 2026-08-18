@@ -32,8 +32,8 @@ def _download(split: str, data_dir: str, max_files: int | None) -> list[str]:
 
 
 def _tokenize_shard(path: str, tokenizer, target: int | None,
-                    arr: np.ndarray, pos: int) -> tuple[int, int]:
-    """Batch-encode one parquet shard into arr[pos:]; returns (new pos, stories)."""
+                    arr: np.ndarray, pos: int) -> tuple[int, int, bool]:
+    """Batch-encode one parquet shard into arr[pos:]; returns (new pos, stories, truncated)."""
     nl = tokenizer.encode("\n", add_special_tokens=False)[0]
     table = pq.read_table(path, columns=["text"])
     texts = table["text"].to_pylist()
@@ -44,15 +44,17 @@ def _tokenize_shard(path: str, tokenizer, target: int | None,
         for ids in enc:
             n = len(ids)
             if pos + n + 1 > arr.shape[0]:
-                return pos, stories
+                print(f"  WARNING: buffer full mid-shard {os.path.basename(path)}; "
+                      f"rest of corpus dropped (raise the token estimate)")
+                return pos, stories, True
             arr[pos:pos + n] = np.asarray(ids, dtype=np.uint16)
             pos += n
             arr[pos] = nl
             pos += 1
             stories += 1
             if target is not None and stories >= target:
-                return pos, stories
-    return pos, stories
+                return pos, stories, False
+    return pos, stories, False
 
 
 def ensure_tokens(split: str, tokenizer, data_dir: str, *, max_files: int | None = None,
@@ -76,7 +78,7 @@ def ensure_tokens(split: str, tokenizer, data_dir: str, *, max_files: int | None
     stories = 0
     for p in paths:
         before = pos
-        pos, n_stories = _tokenize_shard(p, tokenizer, max_stories, arr, pos)
+        pos, n_stories, _ = _tokenize_shard(p, tokenizer, max_stories, arr, pos)
         stories += n_stories
         print(f"  {os.path.basename(p)}: +{pos - before:,} tokens "
               f"({pos:,} total so far)")
@@ -93,13 +95,18 @@ def make_iter(tokens: np.ndarray, batch_size: int, seq_len: int, rng=None):
     """Yield (x, y) numpy int32 pairs of shape (batch, seq).
     x[i, j+1] == y[i, j] (shifted next-token prediction) across the stream."""
     total = tokens.shape[0]
-    max_start = total - batch_size * seq_len - 1
+    need = batch_size * seq_len + 1
+    if total < need:
+        raise ValueError(
+            f"token stream too small ({total:,}) for batch_size={batch_size} x "
+            f"seq_len={seq_len} (+1); need at least {need:,} tokens")
+    max_start = total - need
     if rng is None:
         rng = np.random.default_rng(0)
 
     while True:
         start = rng.integers(0, max_start)
-        seg = tokens[start:start + batch_size * seq_len + 1]
+        seg = tokens[start:start + need]
         x = seg[:-1].reshape(batch_size, seq_len).astype(np.int32)
         y = seg[1:].reshape(batch_size, seq_len).astype(np.int32)
         yield x, y
@@ -122,7 +129,7 @@ def ensure_shards(split: str, tokenizer, data_dir: str, *, max_files: int | None
             nrows = pq.read_metadata(p).num_rows
             cap = nrows * 400 + 1_000_000
             arr = np.empty(cap, dtype=np.uint16)
-            pos, stories = _tokenize_shard(p, tokenizer, max_stories, arr, 0)
+            pos, stories, _ = _tokenize_shard(p, tokenizer, max_stories, arr, 0)
             arr = arr[:pos]
             np.save(cache, arr)
             print(f"  {os.path.basename(p)}: tokenized {pos:,} tokens, "
@@ -155,9 +162,20 @@ REPO_FINEWEB = "EleutherAI/fineweb-edu-dedup-10b"
 
 
 def fineweb_parquets(path: str | os.PathLike) -> list[str]:
-    """Return all *.parquet under a local dir (recursively), sorted."""
+    """Return local *.parquet files with a usable `text` column (recursively), sorted.
+
+    Filters out non-corpus parquets (e.g. reward/preference datasets that lack
+    the `text` column), which would otherwise crash tokenization."""
     import glob as _glob
-    return sorted(_glob.glob(os.path.join(str(path), "**", "*.parquet"), recursive=True))
+    out = []
+    for p in sorted(_glob.glob(os.path.join(str(path), "**", "*.parquet"), recursive=True)):
+        try:
+            cols = pq.read_schema(p).names
+        except Exception:
+            continue
+        if "text" in cols:
+            out.append(p)
+    return out
 
 
 def _tokenize_texts(texts, tokenizer, arr, pos, nl):
@@ -198,6 +216,7 @@ def ensure_fineweb_shards(tokenizer, data_dir: str,
             cap = nrows * 400 + 1_000_000
             arr = np.empty(cap, dtype=np.uint16)
             pos = 0
+            truncated = False
             table = pq.read_table(p, columns=["text"])
             texts = table["text"].to_pylist()
             bs = 512
@@ -206,6 +225,7 @@ def ensure_fineweb_shards(tokenizer, data_dir: str,
                 for ids in enc:
                     n = len(ids)
                     if pos + n + 1 > arr.shape[0]:
+                        truncated = True
                         break
                     arr[pos:pos + n] = np.asarray(ids, dtype=np.uint16)
                     pos += n
@@ -214,6 +234,9 @@ def ensure_fineweb_shards(tokenizer, data_dir: str,
                 else:
                     continue
                 break
+            if truncated:
+                print(f"  WARNING: buffer full mid-shard {os.path.basename(p)}; "
+                      f"rest of corpus dropped (raise the token estimate)")
             arr = arr[:pos]
             np.save(cache, arr)
             print(f"  {os.path.basename(p)}: tokenized {pos:,} tokens")

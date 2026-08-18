@@ -158,7 +158,7 @@ def mla_forward(cfg, p, x, attention_mask=None, token_mask=None):
 # batched einsum (fine at E=4, top-k=1). Routing mask from lax.top_k.
 
 def init_moe(cfg, key):
-    k = jax.random.split(key, 6)
+    k = jax.random.split(key, 7)
     H, M, E = cfg.hidden_size, cfg.intermediate_size, cfg.num_local_experts
     std = cfg.initializer_range
     return {
@@ -167,8 +167,8 @@ def init_moe(cfg, key):
         "expert_up_w": init_linear(k[2], E * M, H, std).reshape(E, M, H),
         "expert_down_w": init_linear(k[3], E * H, M, std).reshape(E, H, M),
         "shared_gate_w": init_linear(k[4], M, H, std),
-        "shared_up_w": init_linear(k[4], M, H, std),
-        "shared_down_w": init_linear(k[5], H, M, std),
+        "shared_up_w": init_linear(k[5], M, H, std),
+        "shared_down_w": init_linear(k[6], H, M, std),
         "norm_w": jnp.ones((H,)),
     }
 
@@ -229,10 +229,6 @@ def moe_forward(cfg, p, x, training=False):
     logits = xf @ p["router_w"].T                       # (N,E)
     topk_val, topk_idx = jax.lax.top_k(logits, k)       # (N,k)
     w = jax.nn.softmax(topk_val, axis=-1)               # (N,k)
-
-    # per-expert token weight: sum of topk weights selecting that expert
-    w_e = jnp.sum(jnp.where(topk_idx[..., None] == jnp.arange(E), w[..., None], 0.0),
-                  axis=1)                               # (N,E)
 
     # Sparse top-k: each token is routed through exactly its k chosen experts
     # via a single padded (E, G, H) grouped matmul (see _grouped_topk). This
@@ -332,18 +328,20 @@ def init_model(cfg, key):
             "input_norm": jnp.ones((H,)),
             "post_norm": jnp.ones((H,)),
         })
+    f_akey, f_mkey = jax.random.split(keys[-2])
+    rkey, lkey = jax.random.split(keys[-1])
     return {
         "embed_tokens": init_linear(keys[-3], cfg.vocab_size, H, std),
         "embed_norm": jnp.ones((H,)),
         "first": {
-            "attn": init_kda(cfg, keys[-2]),
-            "moe": init_moe(cfg, keys[-2]),
+            "attn": init_kda(cfg, f_akey),
+            "moe": init_moe(cfg, f_mkey),
             "input_norm": jnp.ones((H,)),
             "post_norm": jnp.ones((H,)),
         },
         "block": block,
-        "router": init_router(cfg, keys[-1]),
-        "last": {"moe": init_moe(cfg, keys[-1]), "norm": jnp.ones((H,))},
+        "router": init_router(cfg, rkey),
+        "last": {"moe": init_moe(cfg, lkey), "norm": jnp.ones((H,))},
     }
 
 

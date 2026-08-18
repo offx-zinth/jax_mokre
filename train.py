@@ -28,14 +28,16 @@ from . import data as D
 def chunked_ce(cfg, Wt, hidden, labels, chunk):
     """Cross-entropy over the vocab head, computed in seq-chunks to bound memory."""
     B, S, H = hidden.shape
-    losses = []
+    total = 0.0
+    denom = 0
     for i in range(0, S, chunk):
         h = hidden[:, i:i + chunk].reshape(-1, H)
         y = labels[:, i:i + chunk].reshape(-1)
         lg = jnp.einsum("nh,vh->nv", h, Wt)
         logp = jax.nn.log_softmax(lg, axis=-1)
-        losses.append(-jnp.mean(logp[jnp.arange(y.shape[0]), y]))
-    return sum(losses) / len(losses)
+        total = total + (-jnp.sum(logp[jnp.arange(y.shape[0]), y]))
+        denom = denom + y.shape[0]
+    return total / denom
 
 
 def make_loss_fn(cfg, ce_chunk, remat):
@@ -256,6 +258,10 @@ def main():
             print(f"Dataset: {args.split} tokens={tokens.shape[0]:,}")
 
     per = max(args.batch_size // len(devices), 1)
+    if dist and args.batch_size % len(devices) != 0:
+        raise SystemExit(
+            f"--batch_size {args.batch_size} must be divisible by "
+            f"{len(devices)} device(s); got per-device batch {per}")
     step_tokens = per * args.seq_len * len(devices)
 
     step = start_step
