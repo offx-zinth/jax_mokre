@@ -176,7 +176,7 @@ def test_muon_partition_and_ns():
     rms = float(jnp.sqrt(jnp.mean(upd["q_w"] ** 2)))
     assert np.isfinite(rms) and 0.2e-2 < rms < 3e-2, rms
     assert st.mu_mom["q_w"].shape == p["q_w"].shape
-    assert st.adam_mu["q_w"].shape == (0,)      # zero-size sentinel
+    assert st.adam_mu["q_w"].shape == ()      # scalar sentinel (TPU-friendly)
     assert st.adam_mu["norm_w"].shape == p["norm_w"].shape
     print(f"[6] toy step OK  q_w update rms={rms:.4f} (lr=0.01)")
 

@@ -23,11 +23,12 @@ Partitioning follows the papers' guidance:
 Memory notes (10 GB laptop / TPU HBM friendly):
 - one momentum buffer per Muon leaf only (~66M of the 85M params);
 - m + v Adam moments only for the remaining leaves;
-- excluded slots hold ZERO-SIZE sentinel arrays (0 bytes), so no memory is
+- excluded slots hold scalar sentinels (TPU-friendly; XLA dislikes 0-sized
+  dims and they caused `SIGSEGV STACK OVERFLOW` on TpuV5E8), so no memory is
   wasted on masked-out leaves (optax.partition/masked would allocate full-size
   zeros for every branch);
 - Newton-Schulz runs in bf16 on TPU / fp32 on CPU with ~3x one leaf's bytes as
-  transient buffers.
+  transient buffers, via `lax.fori_loop` to avoid unrolling.
 """
 
 from __future__ import annotations
@@ -46,7 +47,9 @@ def newton_schulz(G, steps=5, dtype=jnp.float32):
     """Approximate UV^T of G via the quintic iteration; sigma(O) in [0.7, 1.3].
 
     Runs in `dtype` (bf16 on TPU is far cheaper per matmul) and always leads
-    with the smaller dimension so the iteration converges fast."""
+    with the smaller dimension so the iteration converges fast.
+    Uses `lax.fori_loop` to avoid unrolling 5× matmuls per leaf into the HLO
+    (large-model TPU compile would stack-overflow otherwise)."""
     a, b, c = NS_A, NS_B, NS_C
     X = G.astype(dtype)
     X = X / (jnp.linalg.norm(X) + 1e-7)
@@ -54,10 +57,13 @@ def newton_schulz(G, steps=5, dtype=jnp.float32):
     if X.shape[0] > X.shape[1]:
         X = X.T
         transposed = True
-    for _ in range(steps):
-        A = X @ X.T
+
+    def body(i, X_):
+        A = X_ @ X_.T
         B = b * A + c * (A @ A)
-        X = a * X + B @ X
+        return a * X_ + B @ X_
+
+    X = jax.lax.fori_loop(0, steps, body, X)
     if transposed:
         X = X.T
     return X
@@ -169,11 +175,14 @@ def muon_adamw(mask, *, momentum=0.95, nesterov=True, ns_steps=5,
         return updates, new_state
 
     def init_fn(params):
+        # Scalar sentinels are TPU-friendly (XLA dislikes 0-sized dims and
+        # they caused `SIGSEGV STACK OVERFLOW` on TpuV5E8). The sentinel
+        # value is never used arithmetically for the other branch.
         def fresh_muon(p, m):
-            return jnp.zeros(p.shape, p.dtype) if m else jnp.zeros((0,), p.dtype)
+            return jnp.zeros(p.shape, p.dtype) if m else jnp.zeros((), p.dtype)
 
         def fresh_adam(p, m):
-            return jnp.zeros(p.shape, p.dtype) if not m else jnp.zeros((0,), p.dtype)
+            return jnp.zeros(p.shape, p.dtype) if not m else jnp.zeros((), p.dtype)
 
         zero = jnp.zeros((), jnp.int32)
         return MuonAdamWState(
