@@ -7,10 +7,6 @@ Checks:
   4. MLA attention matches a simple reference.
   5. MoR gating: fully-frozen tokens pass through unchanged.
   6. 10 train steps on synthetic data: finite loss that decreases.
-  7. Muon partitioning: hidden matrices -> Muon; embed/router/norms -> AdamW;
-     Newton-Schulz output is near-semi-orthogonal.
-  8. Muon optimizer actually fits a toy regression end-to-end.
-  9. Full-model Muon train steps (MultiSteps + live lr kwarg): finite loss.
 """
 
 import numpy as np
@@ -21,7 +17,6 @@ import optax
 from .config import MoREConfig
 from . import model as M
 from . import train as T
-from .muon import make_muon_mask, muon_adamw, muon_param_counts, newton_schulz
 
 
 def tinystories():
@@ -125,114 +120,20 @@ def test_moR_gating():
     print("[4] MoR gating: frozen recursion steps are identity OK")
 
 
-def test_muon_partition_and_ns():
-    cfg = tinystories()
-    params = M.init_model(cfg, jax.random.PRNGKey(7))
-    mask = make_muon_mask(params)
-
-    def get(tree, *keys):
-        for k in keys:
-            tree = tree[int(k)] if isinstance(tree, (list, tuple)) else tree[k]
-        return tree
-
-    # hidden matrices -> Muon
-    for path in [("first", "attn", "q_w"), ("block", 0, "attn", "o_w"),
-                 ("block", 2, "attn", "kd_w"),          # mla
-                 ("first", "moe", "expert_gate_w"),     # stacked (E,M,H)
-                 ("block", 0, "moe", "shared_down_w")]:
-        assert get(mask, *path) is True, f"should be Muon: {path}"
-        assert get(params, *path).ndim >= 2
-    # embeddings / recurrence state / norms / routers -> AdamW
-    for path in [("embed_tokens",), ("embed_norm",),
-                 ("first", "attn", "init_state"), ("first", "attn", "gate_b"),
-                 ("first", "moe", "router_w"), ("router", "l1_w"),
-                 ("last", "norm")]:
-        assert get(mask, *path) is False, f"should be AdamW: {path}"
-
-    n_mu, n_ad = muon_param_counts(params, mask)
-    n_tot = M.count_params(params)
-    print(f"[6] partition: muon={n_mu:,} adamw={n_ad:,} total={n_tot:,}")
-    assert n_mu + n_ad == n_tot
-
-    # Newton-Schulz: near-semi-orthogonal in both orientations
-    G = jax.random.normal(jax.random.PRNGKey(8), (64, 128))
-    for X in (G, G.T):
-        sv = jnp.linalg.svd(newton_schulz(X), compute_uv=False)
-        assert float(sv.max()) < 1.3 and float(sv.min()) > 0.5, sv
-    print(f"[6] newton-schulz singular values within [0.5, 1.3] OK")
-
-    # one optimizer step on a toy pytree: updates finite, right branches move
-    p = {"q_w": jnp.ones((32, 16)), "norm_w": jnp.ones((32,)),
-         "embed_tokens": jnp.ones((10, 16))}
-    mk = make_muon_mask(p)
-    assert mk["q_w"] and not mk["norm_w"] and not mk["embed_tokens"]
-    opt = muon_adamw(mk, momentum=0.95)
-    st = opt.init(p)
-    lr = jnp.asarray(1e-2, dtype=jnp.float32)
-    grng = np.random.default_rng(12)
-    g = jax.tree.map(lambda x: jnp.asarray(grng.normal(size=x.shape),
-                                          dtype=x.dtype), p)
-    upd, st = opt.update(g, st, p, learning_rate=lr)
-    rms = float(jnp.sqrt(jnp.mean(upd["q_w"] ** 2)))
-    assert np.isfinite(rms) and 0.2e-2 < rms < 3e-2, rms
-    assert st.mu_mom["q_w"].shape == p["q_w"].shape
-    assert st.adam_mu["q_w"].shape == ()      # scalar sentinel (TPU-friendly)
-    assert st.adam_mu["norm_w"].shape == p["norm_w"].shape
-    print(f"[6] toy step OK  q_w update rms={rms:.4f} (lr=0.01)")
-
-
-def test_muon_fits_regression():
-    rng = np.random.default_rng(9)
-    X = rng.normal(size=(256, 16)).astype(np.float32)
-    W1 = rng.normal(size=(16, 32)) * 0.1
-    W2 = rng.normal(size=(32, 4)) * 0.1
-    Y = np.tanh(X @ W1) @ W2
-
-    params = {"W1": jnp.asarray(rng.normal(size=(16, 32)) * 0.1),
-              "W2": jnp.asarray(rng.normal(size=(32, 4)) * 0.1),
-              "b": jnp.zeros((4,))}
-    mask = make_muon_mask(params)               # W1,W2 -> muon; b -> adamw
-
-    def loss_fn(p):
-        pred = jnp.tanh(X @ p["W1"]) @ p["W2"] + p["b"]
-        return jnp.mean((pred - Y) ** 2)
-
-    opt = muon_adamw(mask, momentum=0.95)
-    st = opt.init(params)
-    lr = jnp.asarray(0.02, dtype=jnp.float32)
-
-    @jax.jit
-    def epoch(params, st):
-        g = jax.grad(loss_fn)(params)
-        upd, st = opt.update(g, st, params, learning_rate=lr)
-        return optax.apply_updates(params, upd), st
-
-    l0 = float(loss_fn(params))
-    for _ in range(200):
-        params, st = epoch(params, st)
-    l1 = float(loss_fn(params))
-    print(f"[7] muon regression fit: {l0:.4f} -> {l1:.4f}")
-    assert np.isfinite(l1) and l1 < 0.25 * l0, (l0, l1)
-
-
 def test_train_steps():
     cfg = tinystories()
     cfg.max_seq_len = 128
     params = M.init_model(cfg, jax.random.PRNGKey(6))
+    from transformers import GPT2TokenizerFast
     from . import data as D
-    # Keep the smoke suite fast/offline: synthetic tokens. Use
-    # jax_mokre.bench_muon --real_data for a real TinyStories comparison.
-    rng = np.random.default_rng(6)
-    tokens = rng.integers(0, cfg.vocab_size,
-                          size=(4 * 20 + 2) * 64, dtype=np.uint16)
+    tokenizer = GPT2TokenizerFast.from_pretrained("gpt2")
+    tokens = D.ensure_tokens("train", tokenizer, "/tmp/tinystories_smoke",
+                             max_files=1, max_stories=2000, force=False)
     it = D.make_iter(tokens, 4, 64)
-    tag = "synthetic"
 
     opt = optax.MultiSteps(
-        optax.chain(
-            optax.clip_by_global_norm(1.0),
-            optax.inject_hyperparams(optax.adamw)(
-                learning_rate=3e-4, b1=0.9, b2=0.95, weight_decay=0.01)),
+        optax.chain(optax.clip_by_global_norm(1.0),
+                    optax.adamw(3e-4, b1=0.9, b2=0.95, weight_decay=0.01)),
         every_k_schedule=2)
     os_ = opt.init(params)
     step = T.make_train_step(cfg, opt, 16, dist=False)
@@ -245,43 +146,9 @@ def test_train_steps():
         lv = float(loss)
         losses.append(lv)
         assert np.isfinite(lv), f"non-finite loss at step {i}: {lv}"
-    print(f"[5] train steps ({tag}): losses = {[round(v, 3) for v in losses]}")
+    print(f"[5] train steps (real TinyStories): losses = {[round(v, 3) for v in losses]}")
     print(f"    first 5 avg {np.mean(losses[:5]):.4f}  last 5 avg {np.mean(losses[-5:]):.4f}")
-    # real data should strictly decrease; synthetic just needs finiteness
-    if tag == "real TinyStories":
-        assert np.mean(losses[-5:]) < np.mean(losses[:5]), losses
-
-
-def test_train_steps_muon():
-    from . import data as D
-    cfg = tinystories()
-    cfg.max_seq_len = 128
-    params = M.init_model(cfg, jax.random.PRNGKey(10))
-    rng = np.random.default_rng(11)
-    n = (4 * 12 + 2) * 64
-    tokens = rng.integers(0, cfg.vocab_size, size=n, dtype=np.uint16)
-    it = D.make_iter(tokens, 4, 64)
-
-    opt = optax.MultiSteps(
-        optax.chain(
-            optax.clip_by_global_norm(1.0),
-            muon_adamw(make_muon_mask(params), momentum=0.95)),
-        every_k_schedule=2)
-    os_ = opt.init(params)
-    step = T.make_train_step(cfg, opt, 16, dist=False)
-
-    losses = []
-    for i in range(12):
-        x, y = next(it)
-        params, os_, loss, ce, aux = step(params, os_, jnp.asarray(x),
-                                          jnp.asarray(y),
-                                          jnp.asarray(1e-4, dtype=jnp.float32))
-        lv = float(loss)
-        losses.append(lv)
-        assert np.isfinite(lv), f"non-finite loss at step {i}: {lv}"
-    print(f"[8] full-model muon steps (synthetic): losses = "
-          f"{[round(v, 3) for v in losses]}")
-    print("    all finite OK")
+    assert np.mean(losses[-5:]) < np.mean(losses[:5]), losses
 
 
 if __name__ == "__main__":
@@ -289,8 +156,5 @@ if __name__ == "__main__":
     test_kda_scan()
     test_mla()
     test_moR_gating()
-    test_muon_partition_and_ns()
-    test_muon_fits_regression()
     test_train_steps()
-    test_train_steps_muon()
     print("\nALL SMOKE TESTS PASSED")

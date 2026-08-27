@@ -14,13 +14,9 @@ python3 -c "import jax; print('devices:', jax.devices())"
 # --- Training ----------------------------------------------------------------
 # batch 64 x seq 512 = 32768 tok/step; accum 8 => 262144 tok/update.
 # 1B tokens ~= 30517 micro-steps (3815 updates). Defaults fit 16GB HBM in f32.
-# Optimizer is Muon on hidden 2D matrices + AdamW on embed/router/norms.
-# On TPU, Newton-Schulz runs in bf16 (much cheaper than float32 on CPU).
 mkdir -p jax_run
 python3 -m jax_mokre.train \
     --config tinystories \
-    --optim muon \
-    --muon_lr_scale "${MUON_LR_SCALE:-1.0}" \
     --seq_len 512 \
     --batch_size 64 \
     --accum 8 \
