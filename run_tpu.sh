@@ -12,9 +12,13 @@ pip install -q optax transformers huggingface_hub pyarrow
 python3 -c "import jax; print('devices:', jax.devices())"
 
 # --- Training ----------------------------------------------------------------
+# L5 fix: CLI pass-through for dataset + mesh + dtype; no hardcoded TinyStories.
 # batch 64 x seq 512 = 32768 tok/step; accum 8 => 262144 tok/update.
-# 1B tokens ~= 30517 micro-steps (3815 updates). Defaults fit 16GB HBM in f32.
+# 1B tokens ~= 30517 micro-steps (3815 updates). Defaults fit 16GB HBM in bf16.
 mkdir -p jax_run
+# Default dtype auto-switches to bfloat16 on TPU (see train.py build_config); override via --param_dtype/--compute_dtype
+# Default mesh: single-device; for 8-way v5e set --mesh 2,4
+# Dataset: default TinyStories; for FineWeb use --fineweb --fineweb_source /path/to/parquet
 python3 -m jax_mokre.train \
     --config tinystories \
     --seq_len 512 \
