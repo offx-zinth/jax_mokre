@@ -432,9 +432,9 @@ def main():
         try:
             from .config import get_12b_config as _g
             # use analytic helper
-            H, NH, NG, D, Inter, E = cfg.hidden_size, cfg.num_attention_heads, cfg.num_key_value_heads, cfg.head_dim, cfg.intermediate_size, cfg.num_local_experts
-            per_kda = NH*D*H + NG*D*H + NG*D*H + H*NH*D + NG*(D+1)*H + NG*(D+1) + H + NG*D
-            per_msa = NH*D*H + NG*D*H + NG*D*H + H*NH*D + NG*cfg.msa_index_dim*H + cfg.msa_index_dim*H + H
+            H, NH, NG, Hd, Inter, E = cfg.hidden_size, cfg.num_attention_heads, cfg.num_key_value_heads, cfg.head_dim, cfg.intermediate_size, cfg.num_local_experts
+            per_kda = NH*Hd*H + NG*Hd*H + NG*Hd*H + H*NH*Hd + NG*(Hd+1)*H + NG*(Hd+1) + H + NG*Hd
+            per_msa = NH*Hd*H + NG*Hd*H + NG*Hd*H + H*NH*Hd + NG*cfg.msa_index_dim*H + cfg.msa_index_dim*H + H
             per_moe = E*H + E*Inter*H + E*Inter*H + E*H*Inter + Inter*H + Inter*H + H*Inter + H
             per_kda_l = per_kda + per_moe + 2*H
             per_msa_l = per_msa + per_moe + 2*H
