@@ -316,8 +316,7 @@ def ensure_smollm_shards(tokenizer, data_dir: str, *,
     for s in subsets:
         assert s in SMOLLM_SUBSETS, s
     os.makedirs(data_dir, exist_ok=True)
-    nl = tokenizer.encode("
-", add_special_tokens=False)[0]
+    nl = tokenizer.encode("\n", add_special_tokens=False)[0]
     shards: list[np.ndarray] = []
     total_cap = 0
     for subset in subsets:
