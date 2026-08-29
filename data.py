@@ -307,13 +307,17 @@ def ensure_smollm_shards(tokenizer, data_dir: str, *,
     fineweb). Call stream_iter or mixture_stream_iter over the result.
 
     Caches are named {subset}_shard{i}.npy under data_dir.
+    Disk-efficient: downloads one parquet at a time, tokenizes to npy, then
+    deletes the parquet blob immediately to keep peak disk ~1 shard (fixes
+    OOM on Kaggle TPU where 340*1.1GB would otherwise fill disk).
     """
     if subsets is None:
         subsets = list(SMOLLM_SUBSETS)
     for s in subsets:
         assert s in SMOLLM_SUBSETS, s
     os.makedirs(data_dir, exist_ok=True)
-    nl = tokenizer.encode("\n", add_special_tokens=False)[0]
+    nl = tokenizer.encode("
+", add_special_tokens=False)[0]
     shards: list[np.ndarray] = []
     total_cap = 0
     for subset in subsets:
@@ -325,42 +329,55 @@ def ensure_smollm_shards(tokenizer, data_dir: str, *,
             break
         if max_files_total:
             files = files[: max(0, max_files_total - len(shards))]
-        paths = [hf_hub_download(REPO_SMOLLM, f, repo_type="dataset", cache_dir=data_dir) for f in files]
-        print(f"SmollM [{subset}]: {len(paths)} shard(s)")
-        for i, p in enumerate(paths):
+        print(f"SmollM [{subset}]: {len(files)} shard(s)")
+        for i, f in enumerate(files):
             # global index for cache name to avoid collision across subsets
             gi = len(shards)
             cache = os.path.join(data_dir, f"smollm_{subset}_shard{i}.npy")
             # also support legacy flat cache name for backward compat check
             if os.path.exists(cache) and not force:
                 arr = np.load(cache, mmap_mode="r")
-                print(f"  {subset}/{os.path.basename(p)}: cached {arr.shape[0]:,} tokens")
+                print(f"  {subset}/{os.path.basename(f)}: cached {arr.shape[0]:,} tokens")
             else:
-                nrows = pq.read_metadata(p).num_rows
-                cap = nrows * 800 + 1_000_000  # ~800 tok/doc is safer for edu web
-                arr = np.empty(cap, dtype=np.uint16)
-                pos = 0
-                table = pq.read_table(p, columns=["text"])
-                texts = table["text"].to_pylist()
-                bs = 512
-                for b in range(0, len(texts), bs):
-                    enc = tokenizer(texts[b:b+bs], add_special_tokens=False)["input_ids"]
-                    for ids in enc:
-                        n = len(ids)
-                        need = pos + n + 1
-                        if need > arr.shape[0]:
-                            arr = _ensure_capacity(arr, need)
-                        arr[pos:pos+n] = np.asarray(ids, dtype=np.uint16)
-                        pos += n
-                        arr[pos] = nl
-                        pos += 1
-                cap_now = arr.shape[0]
-                arr = arr[:pos]
-                np.save(cache, arr)
-                print(f"  {subset}/{os.path.basename(p)}: tokenized {pos:,} tokens cap {cap_now:,} util {pos/cap_now*100:.1f}%")
-                if cap_now != cap:
-                    print(f"  [data] smollm {subset} shard buffer grown {cap:,} -> {cap_now:,}")
-                total_cap += pos
+                # streaming download: one parquet at a time
+                p = hf_hub_download(REPO_SMOLLM, f, repo_type="dataset", cache_dir=data_dir)
+                try:
+                    nrows = pq.read_metadata(p).num_rows
+                    cap = nrows * 800 + 1_000_000  # ~800 tok/doc is safer for edu web
+                    arr = np.empty(cap, dtype=np.uint16)
+                    pos = 0
+                    table = pq.read_table(p, columns=["text"])
+                    texts = table["text"].to_pylist()
+                    bs = 512
+                    for b in range(0, len(texts), bs):
+                        enc = tokenizer(texts[b:b+bs], add_special_tokens=False)["input_ids"]
+                        for ids in enc:
+                            n = len(ids)
+                            need = pos + n + 1
+                            if need > arr.shape[0]:
+                                arr = _ensure_capacity(arr, need)
+                            arr[pos:pos+n] = np.asarray(ids, dtype=np.uint16)
+                            pos += n
+                            arr[pos] = nl
+                            pos += 1
+                    cap_now = arr.shape[0]
+                    arr = arr[:pos]
+                    np.save(cache, arr)
+                    print(f"  {subset}/{os.path.basename(f)}: tokenized {pos:,} tokens cap {cap_now:,} util {pos/cap_now*100:.1f}%")
+                    if cap_now != cap:
+                        print(f"  [data] smollm {subset} shard buffer grown {cap:,} -> {cap_now:,}")
+                    total_cap += pos
+                    arr = np.load(cache, mmap_mode="r")
+                finally:
+                    # free disk: delete parquet blob immediately (peak disk ~1 shard)
+                    try:
+                        if os.path.exists(p):
+                            os.remove(p)
+                        # also try to remove empty snapshot dir symlink target if present
+                        # HF cache keeps blobs under datasets--HuggingFaceTB--smollm-corpus/blobs/
+                        # removing the file above is enough to free 1.1GB per shard
+                    except Exception as e:
+                        print(f"  [data] warning: could not remove {p}: {e}")
             shards.append(arr)
             if max_files_total and len(shards) >= max_files_total:
                 break
