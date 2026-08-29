@@ -432,10 +432,10 @@ def main():
         try:
             from .config import get_12b_config as _g
             # use analytic helper
-            H, NH, NG, D, M, E = cfg.hidden_size, cfg.num_attention_heads, cfg.num_key_value_heads, cfg.head_dim, cfg.intermediate_size, cfg.num_local_experts
+            H, NH, NG, D, Inter, E = cfg.hidden_size, cfg.num_attention_heads, cfg.num_key_value_heads, cfg.head_dim, cfg.intermediate_size, cfg.num_local_experts
             per_kda = NH*D*H + NG*D*H + NG*D*H + H*NH*D + NG*(D+1)*H + NG*(D+1) + H + NG*D
             per_msa = NH*D*H + NG*D*H + NG*D*H + H*NH*D + NG*cfg.msa_index_dim*H + cfg.msa_index_dim*H + H
-            per_moe = E*H + E*M*H + E*M*H + E*H*M + M*H + M*H + H*M + H
+            per_moe = E*H + E*Inter*H + E*Inter*H + E*H*Inter + Inter*H + Inter*H + H*Inter + H
             per_kda_l = per_kda + per_moe + 2*H
             per_msa_l = per_msa + per_moe + 2*H
             n_kda = cfg.layer_types.count("kda"); n_msa = cfg.layer_types.count("msa")
@@ -451,7 +451,7 @@ def main():
             E_emb = len(cfg.engram_ngrams)*cfg.engram_n_embed if cfg.engram_ngrams else 0
             engram_p = total_N*D_head + H*E_emb*2 + H*cfg.engram_kernel_size + 3*H if cfg.engram_enabled else 0
             total = total_block + embed + first + last + router + engram_p
-            per_moe_a = E*H + cfg.top_k*M*H + cfg.top_k*M*H + cfg.top_k*H*M + M*H + M*H + H*M + H
+            per_moe_a = E*H + cfg.top_k*Inter*H + cfg.top_k*Inter*H + cfg.top_k*H*Inter + Inter*H + Inter*H + H*Inter + H
             per_kda_a = per_kda + per_moe_a + 2*H
             per_msa_a = per_msa + per_moe_a + 2*H
             active_block = n_kda*per_kda_a + n_msa*per_msa_a
