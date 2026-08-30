@@ -403,11 +403,13 @@ def main():
     if getattr(args, "mesh", None):
         try:
             from jax.sharding import Mesh
+            import numpy as np
+            devs = np.array(jax.devices())
             dims = [int(x) for x in args.mesh.split(",")]
             if len(dims) == 1:
-                mesh = Mesh(jax.devices().reshape(dims[0]), ("data",))
+                mesh = Mesh(devs.reshape(dims[0]), ("data",))
             elif len(dims) == 2:
-                mesh = Mesh(jax.devices().reshape(dims[0], dims[1]), ("data", "model"))
+                mesh = Mesh(devs.reshape(dims[0], dims[1]), ("data", "model"))
             else:
                 raise ValueError("mesh must be like '2' or '2,4'")
             print(f"  [mesh] {mesh.axis_names} shape {mesh.shape}")
