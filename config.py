@@ -35,9 +35,10 @@ class MoREConfig:
     layer_types: list = field(default_factory=lambda: ["kda", "kda", "msa", "kda"])
 
     router_hidden_size: int = 64
-    load_balancing_loss_coef: float = 0.01
-    recursion_aux_coef: float = 0.03  # pushes router toward deeper recursion (0.03 after tuning; was 0.1)
-    capacity_factor: float = 1.25
+    load_balancing_loss_coef: float = 0.02  # doubled from 0.01 to fix MoE load imbalance (mi*P ~1/E, needs ~0.02 to be non-negligible vs CE ~3)
+    recursion_aux_coef: float = 0.07  # restored from 0.03 (was 0.1) to fix MoR collapse to depth 1; 0.07 balances depth push vs CE
+    router_z_loss_coef: float = 0.001  # z-loss on router logits to prevent logit blowup and collapse
+    capacity_factor: float = 1.5  # increased from 1.25 to reduce expert overflow drops (G = ceil(Nk/E*1.5))
 
     num_experts: int = 8           # routed experts
     num_shared_experts: int = 1
@@ -55,8 +56,8 @@ class MoREConfig:
     #     scores pooled to block level (max) and top-k selected per group.
     #   * Main branch: exact sparse attention over selected blocks only.
     #   * KL alignment loss (see model.msa_forward) weighted by msa_kl_coef.
-    msa_block_size: int = 64       # Bk, tokens per block (paper: 128)
-    msa_topk: int = 4              # k, blocks selected per query per group (paper: 16)
+    msa_block_size: int = 128      # Bk, tokens per block (attention budget 2048 => topk=16)
+    msa_topk: int = 16             # k, blocks selected per query per group (budget = k*Bk = 2048 tokens)
     msa_index_dim: int = 32        # d_idx, index head dim (paper: 64-128)
     msa_kl_coef: float = 0.01      # lambda for KL(teacher || index) aux loss
     msa_warmup_steps: int = 0      # 0 = sparse from step 0; >0 = full attn warmup
@@ -236,9 +237,10 @@ def get_12b_config(
         max_recursion_depth=4,
         layer_types=_layer_pattern_48(),
         router_hidden_size=256,
-        load_balancing_loss_coef=0.01,
-        recursion_aux_coef=0.03,  # push router toward deeper recursion (middle block)
-        capacity_factor=1.25,
+        load_balancing_loss_coef=0.02,
+        recursion_aux_coef=0.07,  # push router toward deeper recursion (middle block)
+        router_z_loss_coef=0.001,
+        capacity_factor=1.5,
         num_experts=num_experts,
         num_shared_experts=1,
         num_local_experts=num_experts,
@@ -246,8 +248,8 @@ def get_12b_config(
         expert_capacity=64,
         kda_state_size=head_dim,
         kda_chunk_size=128,
-        msa_block_size=64,
-        msa_topk=4,
+        msa_block_size=128,
+        msa_topk=16,
         msa_index_dim=128,
         msa_kl_coef=0.01,
         param_dtype=param_dtype,

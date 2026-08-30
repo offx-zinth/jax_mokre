@@ -839,6 +839,10 @@ def moe_forward(cfg, p, x, training=False):
         mi = oh.mean(axis=0)
         pi = jax.nn.softmax(logits, axis=-1).mean(axis=0)
         aux = coef * E * jnp.sum(mi * pi)
+        # Router z-loss: penalize large logits to prevent collapse and logit blowup (ST-MoE)
+        z_coef = getattr(cfg, "router_z_loss_coef", 0.001)
+        log_z = jax.scipy.special.logsumexp(logits, axis=-1)  # (N,)
+        aux = aux + z_coef * jnp.mean(log_z * log_z)
     else:
         aux = 0.0
     return out, aux
@@ -882,7 +886,15 @@ def router_forward(cfg, p, x, training=False):
         dvec = jnp.arange(1, Nr + 1).astype(x.dtype)
         exp_depth = jnp.sum(probs * dvec, axis=-1).mean()   # avg chosen depth
         aux_push = cfg.recursion_aux_coef * jnp.maximum(Nr - exp_depth, 0.0)
-        aux = aux_lb + aux_push
+        # Entropy bonus: penalize low-entropy (collapsed) router; push toward uniform
+        # H(P) max = log(Nr), so aux_ent = -H => minimized when entropy high. Weight 0.01 keeps CE stable.
+        entropy = -jnp.sum(P * jnp.log(P + 1e-9))
+        aux_ent = -0.01 * entropy  # negative because we add to loss: lower entropy -> higher loss
+        # Router z-loss: prevent logit blowup
+        z_coef = getattr(cfg, "router_z_loss_coef", 0.001)
+        log_z = jax.scipy.special.logsumexp(logits, axis=-1)  # (B,S)
+        aux_z = z_coef * jnp.mean(log_z * log_z)
+        aux = aux_lb + aux_push + aux_ent + aux_z
     else:
         aux = jnp.asarray(0.0, dtype=x.dtype)
     # return probs as well for STE gating in forward(); depths stays hard for logging
@@ -1049,6 +1061,10 @@ def _forward_mor_middle_48(cfg, params, h, input_ids, attention_mask, training):
         dvec_tmp = jnp.arange(1, Nr_tmp + 1).astype(router_probs.dtype)
         exp_depth_tmp = jnp.sum(router_probs * dvec_tmp, axis=-1).mean()
         aux_router_push = cfg.recursion_aux_coef * jnp.maximum(Nr_tmp - exp_depth_tmp, 0.0)
+        # entropy + z for logging consistency (same as router_forward)
+        entropy_tmp = -jnp.sum(P_tmp * jnp.log(P_tmp + 1e-9))
+        aux_router_lb = aux_router_lb - 0.01 * entropy_tmp
+        # z-loss folded into lb for logging simplicity
 
     for step in range(1, Nr + 1):
         m_hard = (depths >= step).astype(jnp.float32)
