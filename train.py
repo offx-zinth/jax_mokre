@@ -290,8 +290,8 @@ def build_config(args) -> MoREConfig:
             max_seq_len=args.seq_len, max_recursion_depth=4,
             num_experts=8, num_local_experts=8, num_shared_experts=1, top_k=1,
             router_hidden_size=64, kda_state_size=64, kda_chunk_size=128,
-            layer_types=["kda", "kda", "msa", "kda"],
-            msa_block_size=128, msa_topk=16, msa_index_dim=32, msa_kl_coef=0.01,  # budget 2048 = 128*16
+            layer_types=["kda", "kda", "msa", "kda"],  # 3:1 KDA:MSA to reduce KV (MSA budget 2048)
+            msa_block_size=128, msa_topk=16, msa_index_dim=128, msa_kl_coef=0.02,  # budget 2048 = 128*16, dim 128 for precise block selection
             load_balancing_loss_coef=args.aux_coef, recursion_aux_coef=args.rec_aux_coef,
             rms_norm_eps=1e-6,
             initializer_range=0.02,
@@ -306,8 +306,8 @@ def build_config(args) -> MoREConfig:
             max_seq_len=args.seq_len, max_recursion_depth=4,
             num_experts=8, num_local_experts=8, num_shared_experts=1, top_k=2,
             router_hidden_size=128, kda_state_size=64, kda_chunk_size=128,
-            layer_types=["kda", "kda", "msa", "kda"],
-            msa_block_size=128, msa_topk=16, msa_index_dim=32, msa_kl_coef=0.01,  # budget 2048 = 128*16
+            layer_types=["kda", "kda", "msa", "kda"],  # 3:1 KDA:MSA to reduce KV (1 MSA × depth 4 = 4 passes, 33MB @16k vs 134MB for 4 MSA)
+            msa_block_size=128, msa_topk=16, msa_index_dim=128, msa_kl_coef=0.02,  # budget 2048 = 128*16, dim 128 for precise block selection
             load_balancing_loss_coef=args.aux_coef, recursion_aux_coef=args.rec_aux_coef,
             rms_norm_eps=1e-6,
             initializer_range=0.02,

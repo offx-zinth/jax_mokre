@@ -124,16 +124,15 @@ class MoREConfig:
         # or as 12 recursion blocks each with 4 pattern.
         valid_lens = {4, 48}
         assert len(self.layer_types) in valid_lens, f"layer_types must have 4 or 48 layers, got {len(self.layer_types)}"
-        # Support both 'msa' (new) and 'mla' (legacy checkpoint) as the single sparse layer
+        # Support both 'msa' (new) and 'mla' (legacy checkpoint) as sparse layers
         n_kda = self.layer_types.count("kda")
         n_sparse = self.layer_types.count("msa") + self.layer_types.count("mla")
-        # For 4 layers: 3 KDA +1 MSA; for 48 layers (4*12): 36 KDA +12 MSA
+        # For 4 layers: allow 0-3 KDA + 1-4 MSA (3:1 default, 4 MSA for recall-precise)
+        # For 48 layers: allow flexible 12-36 KDA + 12-36 MSA (3:1 default 36+12, recall-precise 12+36 or 0+48)
         if len(self.layer_types) == 4:
-            assert n_kda == 3, f"must have 3 KDA layers, got {n_kda}"
-            assert n_sparse == 1, f"must have 1 sparse (msa/mla) layer, got {n_sparse}"
+            assert n_kda + n_sparse == 4 and n_sparse >= 1, f"4-layer must have 4 total with >=1 sparse, got {n_kda} KDA + {n_sparse} sparse"
         else:  # 48
-            assert n_kda == 36, f"48-layer must have 36 KDA, got {n_kda}"
-            assert n_sparse == 12, f"48-layer must have 12 sparse, got {n_sparse}"
+            assert n_kda + n_sparse == 48 and n_sparse >= 12, f"48-layer must have 48 total with >=12 sparse, got {n_kda} KDA + {n_sparse} sparse"
         # Normalize legacy 'mla' -> 'msa' for forward compat
         self.layer_types = ["msa" if t == "mla" else t for t in self.layer_types]
         assert self.hidden_size == self.num_attention_heads * self.head_dim
