@@ -107,13 +107,13 @@ def _make_param_shardings(params, mesh):
         p = "/".join(str(k) for k in path)
         if isinstance(val, jnp.ndarray):
             if val.ndim == 2 and "embed_tokens" in p:
-                # (vocab, hidden) -> shard vocab on model
-                return NamedSharding(mesh, P("model", None) if "model" in mesh.axis_names else P(None))
+                # (vocab, hidden) -> shard hidden on model (vocab 50257 %4 !=0, can't shard vocab)
+                return NamedSharding(mesh, P(None, "model") if "model" in mesh.axis_names else P(None))
             if val.ndim == 3 and "expert" in p:
                 # (E, M, H) or (E, H, M) -> shard E on model
                 return NamedSharding(mesh, P("model", None, None) if "model" in mesh.axis_names else P(None))
             if val.ndim == 2 and val.shape[0] == 50257:
-                return NamedSharding(mesh, P("model", None) if "model" in mesh.axis_names else P(None))
+                return NamedSharding(mesh, P(None, "model") if "model" in mesh.axis_names else P(None))
         # default: replicated (or data-sharded if needed)
         return NamedSharding(mesh, P())
     # jax.tree_util.tree_map_with_path available in newer JAX
@@ -630,14 +630,21 @@ def main():
 
     while step < args.total_steps:
         x, y = next(data_iter)
-        if dist:
+        # Mesh (pjit/FSDP) handles sharding via NamedSharding, keep (B,S) 2D; pmap uses (devices, per, S) 3D
+        if mesh is not None:
+            # keep 2D (B=8, S=16384) — device_put with data_sharding will shard axis 0 across mesh['data']
+            x = jnp.asarray(x)
+            y = jnp.asarray(y)
+        elif dist:
             x = x.reshape(len(devices), -1, args.seq_len)
             y = y.reshape(len(devices), -1, args.seq_len)
+            x = jnp.asarray(x)
+            y = jnp.asarray(y)
         else:
             x = x[:per]
             y = y[:per]
-        x = jnp.asarray(x)
-        y = jnp.asarray(y)
+            x = jnp.asarray(x)
+            y = jnp.asarray(y)
         lr = schedule(step, args.lr, args.lr_min, args.warmup_steps, args.total_steps)
         lr = jnp.asarray(lr, dtype=jnp.float32)
 
