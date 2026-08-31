@@ -1115,6 +1115,11 @@ def forward(cfg, params, input_ids, training=False, attention_mask=None, return_
       * flat 48 with no recursion (len 48, depth 1)
       * middle-MoR 48 (len 48, depth 4): 22 flat + 4 MoR x4 + 22 flat, same 4-depth router
     """
+    # Fallback for pmap 3D (devices, per, S) -> (B*per, S) when mesh not used correctly
+    if input_ids.ndim == 3:
+        input_ids = input_ids.reshape(-1, input_ids.shape[-1])
+        if attention_mask is not None and attention_mask.ndim == 3:
+            attention_mask = attention_mask.reshape(-1, attention_mask.shape[-1])
     B, S = input_ids.shape
     # Fast path: flat 48 or middle-MoR 48 have their own forward (no first/last, no global recursion loop)
     if len(cfg.layer_types) == 48:
