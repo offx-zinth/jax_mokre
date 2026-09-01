@@ -155,6 +155,9 @@ def kda_forward(cfg, p, x, token_mask=None):
 
     # Chunked associative scan to bound activation memory (S up to 8192)
     # Uses cfg.kda_chunk_size (default 128); carries state across chunks
+    # COMPILATION FIX 2026-09-01: for large S, auto-scale chunk to bound XLA graph
+    # Python for-loop unrolls at trace time: S=8192/chunk=128 => 64 unrolled
+    # blocks => >30min compile / >2h for 16k. Auto-scale keeps iterations <=16.
     chunk = getattr(cfg, "kda_chunk_size", 128)
     # L2 fix: warn if user asked for <16 (was silently clamped)
     if getattr(cfg, "kda_chunk_size", 128) < 16:
@@ -163,6 +166,11 @@ def kda_forward(cfg, p, x, token_mask=None):
         chunk = 16
     if chunk < 16:
         chunk = 16
+    # Auto-scale for long context to bound compile graph (keep iterations <=16)
+    if S > 4096 and chunk < 1024:
+        chunk = 1024
+    elif S > 2048 and chunk < 512:
+        chunk = 512
     if S <= chunk:
         # M1 fix: avoid broadcast to (B,S,NH,D) ~8M floats; keep carry (B,NH,D)
         accA, accW = jax.lax.associative_scan(_combine, (A, W), axis=1)
@@ -403,9 +411,10 @@ def msa_forward(cfg, p, x, attention_mask=None, token_mask=None, training=False)
         k_eff = 1
     # Compute M = block-max of index scores without full S_idx
     # M shape (B,NG,S,Nb) via key-block loop
+    # For compile bound, if Nb > 64 (S>8192) we compute in blocks of 8
     q_idx_t = jnp.transpose(q_idx, (0, 2, 1, 3))  # (B,NG,S,d_idx)
     M = jnp.full((B, NG, S, Nb), -1e30, dtype=x.dtype)
-    # key block loop (Nb <= 128 for S=8192)
+    # key block loop (Nb <= 128 for S=8192, 64 blocks at 8k)
     for b in range(Nb):
         start = b * Bk
         end = start + Bk

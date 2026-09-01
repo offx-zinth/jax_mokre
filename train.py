@@ -324,15 +324,15 @@ def main():
     ap.add_argument("--hidden_size", type=int, default=None, help="override hidden for 12b (3840 or 4096)")
     ap.add_argument("--intermediate_size", type=int, default=None, help="override per-expert intermediate for 12b (default 1024)")
     ap.add_argument("--dry_run", action="store_true", help="for 12b: only build config + count params, no training (no local training)")
-    ap.add_argument("--seq_len", type=int, default=512)
-    ap.add_argument("--batch_size", type=int, default=16)
+    ap.add_argument("--seq_len", type=int, default=512, help="For TPU v5e compile: 1024 <3min, 2048 <5min, 4096 <10min, 8192 ~15-30min, 16384 >2h may hit idle timeout")
+    ap.add_argument("--batch_size", type=int, default=16, help="Must divide #devices when using pmap (no mesh); with --mesh batch is global")
     ap.add_argument("--total_steps", type=int, default=40000)
     ap.add_argument("--lr", type=float, default=3e-4)
     ap.add_argument("--lr_min", type=float, default=3e-5)
     ap.add_argument("--warmup_steps", type=int, default=2000)
     ap.add_argument("--grad_clip", type=float, default=1.0)
     ap.add_argument("--weight_decay", type=float, default=0.01)
-    ap.add_argument("--accum", type=int, default=4)
+    ap.add_argument("--accum", type=int, default=4, help="Grad accum steps; effective tokens = batch*seq*accum")
     ap.add_argument("--aux_coef", type=float, default=0.02, help="MoE load-balancing coef (doubled from 0.01 to fix expert collapse)")
     ap.add_argument("--rec_aux_coef", type=float, default=0.07,
                     help="recursion depth-push aux: pushes router toward deeper loops (restored from 0.03 to 0.07; was 0.1)")
@@ -394,9 +394,25 @@ def main():
     os.makedirs(args.out_dir, exist_ok=True)
     log_path = os.path.join(args.out_dir, "train.log")
 
+    # JAX compilation cache must be set BEFORE first jit — warn if set late
+    cache_dir = os.environ.get("JAX_COMPILATION_CACHE_DIR", "")
+    if cache_dir:
+        print(f"  [cache] JAX_COMPILATION_CACHE_DIR={cache_dir}")
+    else:
+        print(f"  [cache] WARNING: JAX_COMPILATION_CACHE_DIR not set — first compile will be slow. Set env before 'import jax' for caching.")
+        # set a default to allow second-run caching even if set late
+        os.environ["JAX_COMPILATION_CACHE_DIR"] = "/tmp/jax_cache"
+        os.makedirs("/tmp/jax_cache", exist_ok=True)
+
     devices = jax.devices()
-    dist = len(devices) > 1
-    print(f"JAX devices: {devices}  dist={dist}")
+    # FSDP/pjit handles data sharding itself — don't also pmap-reshape when mesh is set
+    dist = len(devices) > 1 and not getattr(args, "mesh", None)
+    if getattr(args, "mesh", None):
+        print(f"  [dist] mesh set — using pjit/FSDP, pmap dist disabled (dist={dist})")
+    else:
+        print(f"JAX devices: {devices}  dist={dist}")
+        if args.seq_len > 4096 and args.batch_size > 8:
+            print(f"  [compile] WARNING: seq_len={args.seq_len} with batch {args.batch_size} will compile slowly (>20min). Consider --seq_len 2048 --batch_size 32 for fast compile, or auto chunk scaling will help but still heavy.")
 
     # Optional mesh for pjit path (M4): --mesh 2,4 -> (data=2, model=4)
     mesh = None
@@ -627,6 +643,47 @@ def main():
         print(f"  sample@{step_}: {text!r}")
         with open(log_path, "a") as f:
             f.write(f"sample@{step_}: {text!r}\n")
+
+    # Pre-compile with keepalive to avoid TPU idle timeout during XLA compilation
+    # Do a dummy compile probe before the loop so the 2h idle watchdog sees activity
+    print(f"  [compile] starting first step compilation (seq_len={args.seq_len}, batch={args.batch_size}, mesh={'yes' if mesh else 'no'} — this may take 5-15min for 8k)...", flush=True)
+    _compile_t0 = time.time()
+    # Heartbeat thread: print every 60s during compilation to keep Kaggle TPU watchdog happy
+    import threading as _th
+    _stop_hb = _th.Event()
+    def _hb():
+        while not _stop_hb.wait(60):
+            elapsed = time.time() - _compile_t0
+            print(f"  [compile heartbeat] {elapsed:.0f}s compiling... (TPU idle watchdog: still alive)", flush=True)
+    _hb_thread = _th.Thread(target=_hb, daemon=True)
+    _hb_thread.start()
+
+    # Trigger compilation on a tiny dummy batch so first real step doesn't appear hung
+    try:
+        _dummy_x = jnp.zeros((args.batch_size if mesh is not None else max(1, args.batch_size // len(devices) * len(devices) if dist else args.batch_size), args.seq_len) if mesh is None and not dist else (len(devices), max(1, args.batch_size // len(devices)), args.seq_len) if dist else (args.batch_size, args.seq_len), dtype=jnp.int32)
+        # infer correct dummy shape
+        if mesh is not None:
+            _dummy_x = jnp.zeros((args.batch_size, args.seq_len), dtype=jnp.int32)
+            _dummy_y = jnp.zeros((args.batch_size, args.seq_len), dtype=jnp.int32)
+        elif dist:
+            _dummy_x = jnp.zeros((len(devices), max(1, args.batch_size // len(devices)), args.seq_len), dtype=jnp.int32)
+            _dummy_y = jnp.zeros((len(devices), max(1, args.batch_size // len(devices)), args.seq_len), dtype=jnp.int32)
+        else:
+            _dummy_x = jnp.zeros((args.batch_size, args.seq_len), dtype=jnp.int32)
+            _dummy_y = jnp.zeros((args.batch_size, args.seq_len), dtype=jnp.int32)
+        _dummy_lr = jnp.asarray(schedule(start_step, args.lr, args.lr_min, args.warmup_steps, args.total_steps), dtype=jnp.float32)
+        # warmup compile (synchronous block_until_ready to measure)
+        _params_warm, _, _, _, _ = step_fn(params, opt_state, _dummy_x, _dummy_y, _dummy_lr)
+        if hasattr(_params_warm, '__class__'):
+            try:
+                jax.block_until_ready(_params_warm['embed_tokens'] if isinstance(_params_warm, dict) else _params_warm)
+            except Exception:
+                pass
+        print(f"  [compile] warmup done in {time.time()-_compile_t0:.1f}s, entering training loop", flush=True)
+    except Exception as e:
+        print(f"  [compile] warmup probe failed ({e}), continuing to live training (compile will happen on first step)", flush=True)
+    finally:
+        _stop_hb.set()
 
     while step < args.total_steps:
         x, y = next(data_iter)
