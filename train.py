@@ -415,23 +415,36 @@ def main():
             print(f"  [compile] WARNING: seq_len={args.seq_len} with batch {args.batch_size} will compile slowly (>20min). Consider --seq_len 2048 --batch_size 32 for fast compile, or auto chunk scaling will help but still heavy.")
 
     # Optional mesh for pjit path (M4): --mesh 2,4 -> (data=2, model=4)
+    # For short seq (<=2048), data-only sharding OOMs with 35G HBM (pmap is 8x more efficient)
+    # so auto-fallback to pmap for --mesh 8 with short seq.
     mesh = None
     if getattr(args, "mesh", None):
-        try:
-            from jax.sharding import Mesh
-            import numpy as np
-            devs = np.array(jax.devices())
-            dims = [int(x) for x in args.mesh.split(",")]
-            if len(dims) == 1:
-                mesh = Mesh(devs.reshape(dims[0]), ("data",))
-            elif len(dims) == 2:
-                mesh = Mesh(devs.reshape(dims[0], dims[1]), ("data", "model"))
-            else:
-                raise ValueError("mesh must be like '2' or '2,4'")
-            print(f"  [mesh] {mesh.axis_names} shape {mesh.shape}")
-        except Exception as e:
-            print(f"  [mesh] failed to create mesh {args.mesh}: {e}")
+        # auto-fallback: data-only mesh + short seq -> use pmap instead (saves HBM)
+        if args.mesh.strip() == "8" and args.seq_len <= 2048:
+            print(f"  [mesh] auto-fallback: --mesh 8 with seq_len={args.seq_len} would OOM 35G (pjit data-only); using pmap instead (dist). Use --mesh 2,4 or no mesh for short seq.")
             mesh = None
+        else:
+            try:
+                from jax.sharding import Mesh
+                import numpy as np
+                devs = np.array(jax.devices())
+                dims = [int(x) for x in args.mesh.split(",")]
+                if len(dims) == 1:
+                    mesh = Mesh(devs.reshape(dims[0]), ("data",))
+                elif len(dims) == 2:
+                    mesh = Mesh(devs.reshape(dims[0], dims[1]), ("data", "model"))
+                else:
+                    raise ValueError("mesh must be like '2' or '2,4'")
+                print(f"  [mesh] {mesh.axis_names} shape {mesh.shape}")
+            except Exception as e:
+                print(f"  [mesh] failed to create mesh {args.mesh}: {e}")
+                mesh = None
+        # Recompute dist if we fell back from mesh 8
+        if mesh is None and getattr(args, "mesh", None):
+            dist = len(devices) > 1
+            print(f"  [dist] fallback active — dist={dist} (pmap will handle sharding)")
+            # clear mesh arg so later code uses pmap path
+            args.mesh = None
 
     cfg = build_config(args)
     print(f"Config: hidden={cfg.hidden_size} heads={cfg.num_attention_heads} "
@@ -644,12 +657,12 @@ def main():
         with open(log_path, "a") as f:
             f.write(f"sample@{step_}: {text!r}\n")
 
-    # Pre-compile with keepalive to avoid TPU idle timeout during XLA compilation
-    # Do a dummy compile probe before the loop so the 2h idle watchdog sees activity
-    print(f"  [compile] starting first step compilation (seq_len={args.seq_len}, batch={args.batch_size}, mesh={'yes' if mesh else 'no'} — this may take 5-15min for 8k)...", flush=True)
+    # Pre-compile keepalive: heartbeat every 60s during XLA compilation (no dummy step)
+    # Previous warmup dummy caused 35G HBM OOM on data-only mesh (full-batch compilation)
+    # so we only heartbeat and let the first real step compile.
+    print(f"  [compile] starting first step compilation (seq_len={args.seq_len}, batch={args.batch_size}, mesh={'yes' if mesh else 'no'} — this may take 3-15min)...", flush=True)
+    import threading as _th, time as _time2
     _compile_t0 = time.time()
-    # Heartbeat thread: print every 60s during compilation to keep Kaggle TPU watchdog happy
-    import threading as _th
     _stop_hb = _th.Event()
     def _hb():
         while not _stop_hb.wait(60):
@@ -657,33 +670,7 @@ def main():
             print(f"  [compile heartbeat] {elapsed:.0f}s compiling... (TPU idle watchdog: still alive)", flush=True)
     _hb_thread = _th.Thread(target=_hb, daemon=True)
     _hb_thread.start()
-
-    # Trigger compilation on a tiny dummy batch so first real step doesn't appear hung
-    try:
-        _dummy_x = jnp.zeros((args.batch_size if mesh is not None else max(1, args.batch_size // len(devices) * len(devices) if dist else args.batch_size), args.seq_len) if mesh is None and not dist else (len(devices), max(1, args.batch_size // len(devices)), args.seq_len) if dist else (args.batch_size, args.seq_len), dtype=jnp.int32)
-        # infer correct dummy shape
-        if mesh is not None:
-            _dummy_x = jnp.zeros((args.batch_size, args.seq_len), dtype=jnp.int32)
-            _dummy_y = jnp.zeros((args.batch_size, args.seq_len), dtype=jnp.int32)
-        elif dist:
-            _dummy_x = jnp.zeros((len(devices), max(1, args.batch_size // len(devices)), args.seq_len), dtype=jnp.int32)
-            _dummy_y = jnp.zeros((len(devices), max(1, args.batch_size // len(devices)), args.seq_len), dtype=jnp.int32)
-        else:
-            _dummy_x = jnp.zeros((args.batch_size, args.seq_len), dtype=jnp.int32)
-            _dummy_y = jnp.zeros((args.batch_size, args.seq_len), dtype=jnp.int32)
-        _dummy_lr = jnp.asarray(schedule(start_step, args.lr, args.lr_min, args.warmup_steps, args.total_steps), dtype=jnp.float32)
-        # warmup compile (synchronous block_until_ready to measure)
-        _params_warm, _, _, _, _ = step_fn(params, opt_state, _dummy_x, _dummy_y, _dummy_lr)
-        if hasattr(_params_warm, '__class__'):
-            try:
-                jax.block_until_ready(_params_warm['embed_tokens'] if isinstance(_params_warm, dict) else _params_warm)
-            except Exception:
-                pass
-        print(f"  [compile] warmup done in {time.time()-_compile_t0:.1f}s, entering training loop", flush=True)
-    except Exception as e:
-        print(f"  [compile] warmup probe failed ({e}), continuing to live training (compile will happen on first step)", flush=True)
-    finally:
-        _stop_hb.set()
+    # No dummy compile — first real step will compile. Heartbeat will be stopped after first step completes.
 
     while step < args.total_steps:
         x, y = next(data_iter)
@@ -706,6 +693,10 @@ def main():
         lr = jnp.asarray(lr, dtype=jnp.float32)
 
         params, opt_state, loss, ce, aux = step_fn(params, opt_state, x, y, lr)
+        # Stop heartbeat after first successful compilation (first step may take 3-15min)
+        if step == start_step:
+            _stop_hb.set()
+            print(f"  [compile] first step compiled in {time.time()-_compile_t0:.1f}s, heartbeat stopped", flush=True)
 
         loss_v = float(np.asarray(loss).mean())
         if np.isfinite(loss_v):
