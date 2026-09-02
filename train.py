@@ -426,7 +426,6 @@ def main():
         else:
             try:
                 from jax.sharding import Mesh
-                import numpy as np
                 devs = np.array(jax.devices())
                 dims = [int(x) for x in args.mesh.split(",")]
                 if len(dims) == 1:
