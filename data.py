@@ -395,18 +395,31 @@ def list_smolm2() -> list[str]:
     files = [f for f in list_repo_files(REPO_SMOLM2, repo_type="dataset") if f.endswith(".parquet")]
     return sorted(files)
 
-def ensure_smolm2_shards(tokenizer, data_dir: str, *, max_files: int | None = None, force: bool = False) -> list[np.ndarray]:
-    """Tokenize EleutherAI/SmolLM2-135M-10B shard-by-shard -> per-shard uint16 npy caches."""
+def ensure_smolm2_shards(tokenizer, data_dir: str, *, max_files: int | None = None, offset: int = 0, force: bool = False, reuse_cache_slot: bool = False) -> list[np.ndarray]:
+    """Tokenize EleutherAI/SmolLM2-135M-10B shard-by-shard -> per-shard uint16 npy caches.
+    offset: start index in full 85 list (for disk-friendly phased training 3-4 shards at a time)
+    reuse_cache_slot: if True, cache files are named smollm2_shard0..3 reused each phase (keeps disk ~4*0.6GB)
+    """
     os.makedirs(data_dir, exist_ok=True)
     files = list_smolm2()
-    if max_files:
+    # apply offset + max_files slicing
+    if offset:
+        files = files[offset: offset + max_files] if max_files else files[offset:]
+    elif max_files:
         files = files[:max_files]
     nl = tokenizer.encode("\n", add_special_tokens=False)[0]
     print(f"SmolLM2-10B: {len(files)} shard(s) from {REPO_SMOLM2}")
     shards: list[np.ndarray] = []
     total = 0
     for i, f in enumerate(files):
-        cache = os.path.join(data_dir, f"smollm2_shard{i}.npy")
+        # cache slot reuse keeps disk at ~4 shards (~2.4GB) instead of 85*0.6GB
+        slot = i if not reuse_cache_slot else i % 4
+        # when offset is used, include global index in cache name unless reuse
+        if reuse_cache_slot:
+            cache = os.path.join(data_dir, f"smollm2_shard{slot}.npy")
+        else:
+            global_i = offset + i
+            cache = os.path.join(data_dir, f"smollm2_shard{global_i}.npy")
         if os.path.exists(cache) and not force:
             arr = np.load(cache, mmap_mode="r")
             print(f"  {os.path.basename(f)}: cached {arr.shape[0]:,} tokens")

@@ -382,6 +382,10 @@ def main():
                      help="train on EleutherAI/SmolLM2-135M-10B (85 shards, 10B tokens, data/train-*.parquet)")
     ap.add_argument("--smollm2_max_files", type=int, default=None,
                      help="max files for SmolLM2 10B (e.g. 2 for smoke, 85 for full 10B)")
+    ap.add_argument("--smollm2_offset", type=int, default=0,
+                     help="start offset for SmolLM2 shards (for disk-friendly phased training 0,4,8...)")
+    ap.add_argument("--smollm2_reuse_cache", action="store_true",
+                     help="reuse 4 cache slots (smollm2_shard0..3) when doing phased 3-4 shard downloads to keep disk ~2.4GB")
     # --- Dtype (M5) ---
     ap.add_argument("--param_dtype", type=str, default="float32", choices=["float32","bfloat16","float16"],
                     help="param storage dtype (float32 default; bfloat16 on TPU for HBM/throughput)")
@@ -611,11 +615,11 @@ def main():
         print(f"Dataset: FineWeb-Edu streamed across {n_shards} shard(s), "
               f"{steps_per_shard} steps/shard")
     elif args.smollm2:
-        shards = D.ensure_smolm2_shards(tokenizer, args.data_dir, max_files=args.smollm2_max_files)
+        shards = D.ensure_smolm2_shards(tokenizer, args.data_dir, max_files=args.smollm2_max_files, offset=args.smollm2_offset, reuse_cache_slot=args.smollm2_reuse_cache)
         n_shards = len(shards)
         steps_per_shard = max(int(np.ceil(args.total_steps / max(n_shards, 1))), 1)
         data_iter = D.stream_iter(shards, args.batch_size, args.seq_len, steps_per_shard)
-        print(f"Dataset: EleutherAI/SmolLM2-135M-10B streamed across {n_shards} shard(s), {steps_per_shard} steps/shard (~10B tokens, 85 shards)")
+        print(f"Dataset: EleutherAI/SmolLM2-135M-10B streamed across {n_shards} shard(s) offset={args.smollm2_offset} reuse={args.smollm2_reuse_cache}, {steps_per_shard} steps/shard (~10B tokens, 85 shards disk-friendly 3-4 at a time)")
     elif args.synthetic:
         rngd = np.random.default_rng(args.seed)
         tokens = rngd.integers(0, cfg.vocab_size, size=100_000, dtype=np.uint16)
