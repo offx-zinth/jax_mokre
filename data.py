@@ -384,6 +384,63 @@ def ensure_smollm_shards(tokenizer, data_dir: str, *,
     return shards
 
 
+# ---------------------------------------------------------------------------
+# EleutherAI/SmolLM2-135M-10B — 10B sample of SmolLM2 2T mixture (85 parquet shards)
+# HF dataset: data/train-*.parquet (85 files, ~25GB download, 42GB uncompressed)
+# Features: text (string), source (string). Tokenized like smollm: one shard
+# = one uint16 npy cache, streamed. Use via --smollm2 on train.py.
+REPO_SMOLM2 = "EleutherAI/SmolLM2-135M-10B"
+
+def list_smolm2() -> list[str]:
+    files = [f for f in list_repo_files(REPO_SMOLM2, repo_type="dataset") if f.endswith(".parquet")]
+    return sorted(files)
+
+def ensure_smolm2_shards(tokenizer, data_dir: str, *, max_files: int | None = None, force: bool = False) -> list[np.ndarray]:
+    """Tokenize EleutherAI/SmolLM2-135M-10B shard-by-shard -> per-shard uint16 npy caches."""
+    os.makedirs(data_dir, exist_ok=True)
+    files = list_smolm2()
+    if max_files:
+        files = files[:max_files]
+    nl = tokenizer.encode("\n", add_special_tokens=False)[0]
+    print(f"SmolLM2-10B: {len(files)} shard(s) from {REPO_SMOLM2}")
+    shards: list[np.ndarray] = []
+    total = 0
+    for i, f in enumerate(files):
+        cache = os.path.join(data_dir, f"smollm2_shard{i}.npy")
+        if os.path.exists(cache) and not force:
+            arr = np.load(cache, mmap_mode="r")
+            print(f"  {os.path.basename(f)}: cached {arr.shape[0]:,} tokens")
+        else:
+            p = hf_hub_download(REPO_SMOLM2, f, repo_type="dataset", cache_dir=data_dir)
+            try:
+                nrows = pq.read_metadata(p).num_rows
+                cap = nrows * 800 + 1_000_000
+                arr = np.empty(cap, dtype=np.uint16)
+                pos = 0
+                table = pq.read_table(p, columns=["text"])
+                texts = table["text"].to_pylist()
+                bs = 512
+                for b in range(0, len(texts), bs):
+                    enc = tokenizer(texts[b:b+bs], add_special_tokens=False)["input_ids"]
+                    for ids in enc:
+                        n = len(ids); need = pos + n + 1
+                        if need > arr.shape[0]:
+                            arr = _ensure_capacity(arr, need)
+                        arr[pos:pos+n] = np.asarray(ids, dtype=np.uint16); pos += n; arr[pos]=nl; pos+=1
+                cap_now = arr.shape[0]; arr = arr[:pos]; np.save(cache, arr)
+                print(f"  {os.path.basename(f)}: tokenized {pos:,} tokens cap {cap_now:,} util {pos/cap_now*100:.1f}%")
+                total += pos
+                arr = np.load(cache, mmap_mode="r")
+            finally:
+                try:
+                    if os.path.exists(p): os.remove(p)
+                except Exception as e:
+                    print(f"  [data] warning: could not remove {p}: {e}")
+        shards.append(arr)
+    print(f"SmolLM2 total: {len(shards)} shards, ~{total:,} tokens tokenized (cached)")
+    return shards
+
+
 def mixture_stream_iter(shards_a: list[np.ndarray], shards_b: list[np.ndarray],
                         batch_size: int, seq_len: int,
                         steps_per_shard: int,

@@ -259,6 +259,13 @@ def build_config(args) -> MoREConfig:
             compute_dtype=getattr(args, "compute_dtype", "bfloat16"),
             max_seq_len=args.seq_len,
         )
+    # Engram on MSA recursion layer (idx 2) when requested: set engram_layers=[2]
+    _engram_layers = getattr(args, "engram_layers", None)
+    if isinstance(_engram_layers, str):
+        _engram_layers = [int(x) for x in _engram_layers.split(",") if x.strip()!=""]
+    # default: when --engram set without explicit layers, put on MSA layer (2) as requested
+    if args.engram and _engram_layers is None:
+        _engram_layers = [2]  # 3:1 layer_types ["kda","kda","msa","kda"] → MSA is idx 2
     engram_kw = dict(
         engram_enabled=args.engram,
         engram_vocab_size=args.engram_vocab_size,
@@ -268,6 +275,7 @@ def build_config(args) -> MoREConfig:
         engram_kernel_size=args.engram_kernel_size,
         engram_seed=args.seed,
         engram_pad_id=0,
+        engram_layers=_engram_layers,
     )
     # M5 fix: dtype policy - use CLI if provided, else auto bfloat16 on TPU
     param_dtype = getattr(args, "param_dtype", "float32")
@@ -369,7 +377,11 @@ def main():
     ap.add_argument("--smollm_max_files", type=int, default=None,
                     help="max files TOTAL across all smollm subsets (e.g. 10 for smoke)")
     ap.add_argument("--smollm_max_per_subset", type=int, default=None,
-                    help="max files per subset (overrides total if set)")
+                     help="max files per subset (overrides total if set)")
+    ap.add_argument("--smollm2", action="store_true",
+                     help="train on EleutherAI/SmolLM2-135M-10B (85 shards, 10B tokens, data/train-*.parquet)")
+    ap.add_argument("--smollm2_max_files", type=int, default=None,
+                     help="max files for SmolLM2 10B (e.g. 2 for smoke, 85 for full 10B)")
     # --- Dtype (M5) ---
     ap.add_argument("--param_dtype", type=str, default="float32", choices=["float32","bfloat16","float16"],
                     help="param storage dtype (float32 default; bfloat16 on TPU for HBM/throughput)")
@@ -388,7 +400,9 @@ def main():
     ap.add_argument("--engram_n_head", type=int, default=4,
                     help="Engram heads per n-gram (D_head=n_embed//n_head)")
     ap.add_argument("--engram_kernel_size", type=int, default=4,
-                    help="Engram short-conv kernel size")
+                     help="Engram short-conv kernel size")
+    ap.add_argument("--engram_layers", type=str, default=None,
+                     help="comma list of layer indices for Engram (e.g. '2' for MSA recursion layer, '1,2'); default None→global, default when --engram is '2'")
     args = ap.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
@@ -596,6 +610,12 @@ def main():
                                   steps_per_shard)
         print(f"Dataset: FineWeb-Edu streamed across {n_shards} shard(s), "
               f"{steps_per_shard} steps/shard")
+    elif args.smollm2:
+        shards = D.ensure_smolm2_shards(tokenizer, args.data_dir, max_files=args.smollm2_max_files)
+        n_shards = len(shards)
+        steps_per_shard = max(int(np.ceil(args.total_steps / max(n_shards, 1))), 1)
+        data_iter = D.stream_iter(shards, args.batch_size, args.seq_len, steps_per_shard)
+        print(f"Dataset: EleutherAI/SmolLM2-135M-10B streamed across {n_shards} shard(s), {steps_per_shard} steps/shard (~10B tokens, 85 shards)")
     elif args.synthetic:
         rngd = np.random.default_rng(args.seed)
         tokens = rngd.integers(0, cfg.vocab_size, size=100_000, dtype=np.uint16)
