@@ -133,7 +133,7 @@ def make_train_step_pjit(cfg, opt, ce_chunk, mesh=None, remat=True):
     replicated ×8 = 8GB), use this pjit path with explicit sharding:
 
         from jax.sharding import Mesh
-        mesh = Mesh(jax.devices().reshape(2,4), ("data","model"))
+        mesh = Mesh(np.array(jax.devices()).reshape(2,4), ("data","model"))
         step_fn = make_train_step_pjit(cfg, opt, 32, mesh=mesh)
         # Params will be auto-sharded: embed_tokens on vocab/model, experts on E.
         # Batch is sharded on "data".
@@ -293,11 +293,11 @@ def build_config(args) -> MoREConfig:
             pass
     if args.config == "tinystories":
         cfg = MoREConfig(
-            vocab_size=50257, hidden_size=384, intermediate_size=1024,
+            vocab_size=50257, hidden_size=384, intermediate_size=768,
             num_attention_heads=6, num_key_value_heads=2, head_dim=64,
             max_seq_len=args.seq_len, max_recursion_depth=4,
             num_experts=8, num_local_experts=8, num_shared_experts=1, top_k=1,
-            router_hidden_size=64, kda_state_size=64, kda_chunk_size=128,
+            router_hidden_size=64, kda_state_size=64, kda_chunk_size=512,
             layer_types=["kda", "kda", "msa", "kda"],  # 3:1 KDA:MSA to reduce KV (MSA budget 2048)
             msa_block_size=128, msa_topk=16, msa_index_dim=128, msa_kl_coef=0.02,  # budget 2048 = 128*16, dim 128 for precise block selection
             load_balancing_loss_coef=args.aux_coef, recursion_aux_coef=args.rec_aux_coef,
@@ -309,11 +309,11 @@ def build_config(args) -> MoREConfig:
         )
     else:
         cfg = MoREConfig(
-            vocab_size=50257, hidden_size=1024, intermediate_size=1024,
+            vocab_size=50257, hidden_size=1024, intermediate_size=768,
             num_attention_heads=16, num_key_value_heads=8, head_dim=64,
             max_seq_len=args.seq_len, max_recursion_depth=4,
             num_experts=8, num_local_experts=8, num_shared_experts=1, top_k=2,
-            router_hidden_size=128, kda_state_size=64, kda_chunk_size=128,
+            router_hidden_size=128, kda_state_size=64, kda_chunk_size=512,
             layer_types=["kda", "kda", "msa", "kda"],  # 3:1 KDA:MSA to reduce KV (1 MSA × depth 4 = 4 passes, 33MB @16k vs 134MB for 4 MSA)
             msa_block_size=128, msa_topk=16, msa_index_dim=128, msa_kl_coef=0.02,  # budget 2048 = 128*16, dim 128 for precise block selection
             load_balancing_loss_coef=args.aux_coef, recursion_aux_coef=args.rec_aux_coef,
@@ -527,6 +527,14 @@ def main():
             if ckpt_cfg.hidden_size != cur_cfg.hidden_size or ckpt_cfg.layer_types != cur_cfg.layer_types:
                 print(f"  [ckpt] WARNING: checkpoint hidden {ckpt_cfg.hidden_size} layers {ckpt_cfg.layer_types} != current {cur_cfg.hidden_size} {cur_cfg.layer_types}")
         print(f"Resumed from {args.resume} at step {start_step} (v{st.get('version',1)})")
+        # Resume device_put: pickle restores HOST-numpy params/opt -> put on device ONCE.
+        # Without this, pmap H2D-transfers ~1.5GB every micro-step: resumed phases run
+        # ~10x slow and churn fragments HBM -> E0101. Fresh phases are immune
+        # (init_model arrays stay device-resident). Mesh path below re-shards anyway.
+        params = jax.tree_util.tree_map(lambda x: jax.device_put(x) if isinstance(x, np.ndarray) else x, params)
+        opt_state = jax.tree_util.tree_map(lambda x: jax.device_put(x) if isinstance(x, np.ndarray) else x, opt_state)
+        jax.block_until_ready((params, opt_state))
+        print("  [ckpt] params/opt resident device buffers (single transfer, reused)")
     else:
         params = M.init_model(cfg, rng)
         rng, _ = jax.random.split(rng)
