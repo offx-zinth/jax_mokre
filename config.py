@@ -189,6 +189,18 @@ def _layer_pattern_48():
     return base * 12  # 36 KDA +12 MSA
 
 
+def _layer_pattern_48_middle6():
+    """12 blocks = 3 prefix + 6 middle (recursive) + 3 suffix. Block0 is 2:2 msa,msa,kda,kda per request."""
+    blocks = []
+    for i in range(12):
+        if i == 0:
+            blocks.extend(["msa", "msa", "kda", "kda"])  # 2:2 first block
+        else:
+            blocks.extend(["kda", "kda", "msa", "kda"])  # 3:1 rest
+    # 12*4=48: 2*MSA+2*KDA in block0 + 11* (3KDA+1MSA) = 35 KDA +13 MSA (was 36+12)
+    return blocks
+
+
 def get_12b_config(
     hidden_size: int = 3840,
     intermediate_size: int = 1024,
@@ -229,12 +241,11 @@ def get_12b_config(
         num_attention_heads=num_heads,
         num_key_value_heads=num_kv,
         head_dim=head_dim,
-        # 48 layers (4*12) with MoR 4 recursion in the middle:
-        # 22 flat prefix + 4 MoR shared block ×4 depth + 22 flat suffix = 48 distinct
-        # params, 60 layer forwards. Keeps the same MoR 4-depth router as tinystories.
-        num_recursion_blocks=12,
+        # 48 layers (4*12): 3 prefix + 6 middle recursive + 3 suffix = 12 blocks.
+        # Block0 is 2:2 msa,msa,kda,kda per request; rest 3:1. Middle 6 blocks (layers 12-35) are MoR depth-4.
+        num_recursion_blocks=6,
         max_recursion_depth=4,
-        layer_types=_layer_pattern_48(),
+        layer_types=_layer_pattern_48_middle6(),
         router_hidden_size=256,
         load_balancing_loss_coef=0.02,
         recursion_aux_coef=0.07,  # push router toward deeper recursion (middle block)
