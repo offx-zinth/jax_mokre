@@ -119,11 +119,10 @@ class MoREConfig:
             self.kda_state_size = self.head_dim
         assert self.param_dtype in ("float32", "bfloat16", "float16")
         assert self.compute_dtype in ("float32", "bfloat16", "float16")
-        # --- Layer pattern: support both 4-layer recursion block and 48-layer flat 4*12 ---
-        # Legacy: 4 layers ["kda","kda","msa","kda"]; Scale: 48 layers (4*12) as flat unrolled
-        # or as 12 recursion blocks each with 4 pattern.
-        valid_lens = {4, 48}
-        assert len(self.layer_types) in valid_lens, f"layer_types must have 4 or 48 layers, got {len(self.layer_types)}"
+        # --- Layer pattern: support 4-layer recursion, 48-layer (4*12) and 192-layer (4*48) ---
+        # Legacy: 4 layers ["kda","kda","msa","kda"]; Scale: 48 layers (4*12) or 192 layers (4*48) flat unrolled
+        valid_lens = {4, 48, 93, 192}
+        assert len(self.layer_types) in valid_lens, f"layer_types must have 4, 48, 93 or 192 layers, got {len(self.layer_types)}"
         # Support both 'msa' (new) and 'mla' (legacy checkpoint) as sparse layers
         n_kda = self.layer_types.count("kda")
         n_sparse = self.layer_types.count("msa") + self.layer_types.count("mla")
@@ -131,8 +130,12 @@ class MoREConfig:
         # For 48 layers: allow flexible 12-36 KDA + 12-36 MSA (3:1 default 36+12, recall-precise 12+36 or 0+48)
         if len(self.layer_types) == 4:
             assert n_kda + n_sparse == 4 and n_sparse >= 1, f"4-layer must have 4 total with >=1 sparse, got {n_kda} KDA + {n_sparse} sparse"
-        else:  # 48
+        elif len(self.layer_types) == 48:
             assert n_kda + n_sparse == 48 and n_sparse >= 12, f"48-layer must have 48 total with >=12 sparse, got {n_kda} KDA + {n_sparse} sparse"
+        elif len(self.layer_types) == 93:
+            assert n_kda + n_sparse == 93 and n_sparse >= 23, f"93-layer must have 93 total with >=23 sparse, got {n_kda} KDA + {n_sparse} sparse"
+        else:  # 192
+            assert n_kda + n_sparse == 192 and n_sparse >= 48, f"192-layer must have 192 total with >=48 sparse, got {n_kda} KDA + {n_sparse} sparse"
         # Normalize legacy 'mla' -> 'msa' for forward compat
         self.layer_types = ["msa" if t == "mla" else t for t in self.layer_types]
         assert self.hidden_size == self.num_attention_heads * self.head_dim
@@ -163,19 +166,19 @@ class MoREConfig:
 
     @property
     def num_layers(self) -> int:
-        # For flat 48-layer model, num_layers is len(layer_types) (48).
+        # For flat 48/93/192-layer model, num_layers is len(layer_types).
         # For recursion model, num_layers = num_recursion_blocks * max_recursion_depth
         # where recursion depth is steps over the shared block.
-        if len(self.layer_types) == 48:
-            return 48
+        if len(self.layer_types) in (48, 93, 192):
+            return len(self.layer_types)
         return self.num_recursion_blocks * self.max_recursion_depth
 
     @property
     def total_forward_layers(self) -> int:
         """Total transformer layer forward passes (attention+MoE) per token."""
-        if len(self.layer_types) == 48:
-            # flat 48 unique layers, no recursion sharing
-            return 48
+        if len(self.layer_types) in (48, 93, 192):
+            # flat unique layers, no recursion sharing
+            return len(self.layer_types)
         # recursion: first + block*depth + last is accounted separately, but num_layers is depth*blocks
         return self.num_recursion_blocks * self.max_recursion_depth * len(self.layer_types) // 4 + 1  # +1 for first/last nuance
 
@@ -199,6 +202,57 @@ def _layer_pattern_48_middle6():
             blocks.extend(["kda", "kda", "msa", "kda"])  # 3:1 rest
     # 12*4=48: 2*MSA+2*KDA in block0 + 11* (3KDA+1MSA) = 35 KDA +13 MSA (was 36+12)
     return blocks
+
+
+def _layer_pattern_192():
+    """48 blocks = 12 prefix + 24 middle + 12 suffix = 192 layers. Block0 2:2, rest 3:1."""
+    blocks = []
+    for i in range(48):
+        if i == 0:
+            blocks.extend(["msa", "msa", "kda", "kda"])
+        else:
+            blocks.extend(["kda", "kda", "msa", "kda"])
+    # 48*4=192: 140 KDA +52 MSA (block0 2:2 + 47*3:1)
+    return blocks
+
+
+def _layer_pattern_93():
+    """93 layers baked: block0 unique 2:2, blocks1-6 =2 distinct x3 forced R, blocks7-17 =11 MoR, blocks18-23 =3 distinct x2 forced R =>96 fw truncated to 93."""
+    # distinct patterns (will be expanded as forwards for now, weight tying later)
+    b0 = ["msa", "msa", "kda", "kda"]  # block0 1x
+    bA = ["kda", "kda", "msa", "kda"]  # for 1-6: 2 distinct A,B
+    bB = ["kda", "kda", "msa", "kda"]
+    # expand forced R: 2 distinct x3 =6 blocks (24 fw)
+    prefix_mid = []
+    for _ in range(3):
+        prefix_mid.extend(bA)
+    for _ in range(3):
+        prefix_mid.extend(bB)
+    # middle 11 blocks MoR distinct 44 fw
+    middle = []
+    for _ in range(11):
+        middle.extend(["kda", "kda", "msa", "kda"])
+    # suffix 3 distinct x2 =6 blocks (24 fw) C,D,E
+    bC = ["kda", "kda", "msa", "kda"]
+    bD = ["kda", "kda", "msa", "kda"]
+    bE = ["kda", "kda", "msa", "kda"]
+    suffix = []
+    for _ in range(2):
+        suffix.extend(bC)
+    for _ in range(2):
+        suffix.extend(bD)
+    for _ in range(2):
+        suffix.extend(bE)
+    fw = b0 + prefix_mid + middle + suffix  # 4+24+44+24=96
+    # truncate to 93 as requested (drop last 3 of suffix)
+    fw = fw[:93]
+    # 69 KDA+24 MSA =93, 93*8=744 vs 192*8=1536
+    return fw
+
+
+def _split_93():
+    # baked 93 fw: 0: block0 4, 1-6: 2x3=24 (4-27), 7-17: 11=44 (28-71), 18-23: 6=24 truncated to 21 (72-92)
+    return {"prefix_block0": list(range(0, 4)), "prefix_R_1_6": list(range(4, 28)), "middle_MoR": list(range(28, 72)), "suffix_R_18_23": list(range(72, 93))}
 
 
 def get_12b_config(
@@ -284,3 +338,12 @@ def get_12b_3840_config(**kw) -> "MoREConfig":
 
 def get_12b_4096_config(**kw) -> "MoREConfig":
     return get_12b_config(hidden_size=4096, **kw)
+
+
+def get_93l_config(hidden_size: int = 3840, num_experts: int = 8, **kw) -> "MoREConfig":
+    """93 layers 69KDA+24MSA, 8 experts top2 => 744 experts (vs 192*8=1536). 6 prefix(24)+11 middle(44)+6 suffix(24)+1."""
+    cfg = get_12b_config(hidden_size=hidden_size, num_experts=num_experts, **kw)
+    cfg.layer_types = _layer_pattern_93()
+    cfg.num_recursion_blocks = 11  # middle 11 blocks (44 layers) recursive depth4
+    cfg.__post_init__()
+    return cfg
