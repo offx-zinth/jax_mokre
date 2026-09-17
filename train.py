@@ -386,6 +386,11 @@ def main():
                      help="start offset for SmolLM2 shards (for disk-friendly phased training 0,4,8...)")
     ap.add_argument("--smollm2_reuse_cache", action="store_true",
                      help="reuse 4 cache slots (smollm2_shard0..3) when doing phased 3-4 shard downloads to keep disk ~2.4GB")
+    ap.add_argument("--smollm2_sliding", action="store_true",
+                     help="single-session sliding window: keep optimizer/params resident, disk window=4 shards overlapped=1 (no phased save/resume)")
+    ap.add_argument("--smollm2_window", type=int, default=4, help="sliding window size (shards on disk, default 4 ~2.4GB)")
+    ap.add_argument("--smollm2_overlap", type=int, default=1, help="overlap shards kept across window slide (default 1)")
+    ap.add_argument("--smollm2_no_shuffle", action="store_true", help="disable shuffle for sliding order (default shuffled)")
     # --- Dtype (M5) ---
     ap.add_argument("--param_dtype", type=str, default="float32", choices=["float32","bfloat16","float16"],
                     help="param storage dtype (float32 default; bfloat16 on TPU for HBM/throughput)")
@@ -623,11 +628,18 @@ def main():
         print(f"Dataset: FineWeb-Edu streamed across {n_shards} shard(s), "
               f"{steps_per_shard} steps/shard")
     elif args.smollm2:
-        shards = D.ensure_smolm2_shards(tokenizer, args.data_dir, max_files=args.smollm2_max_files, offset=args.smollm2_offset, reuse_cache_slot=args.smollm2_reuse_cache)
-        n_shards = len(shards)
-        steps_per_shard = max(int(np.ceil(args.total_steps / max(n_shards, 1))), 1)
-        data_iter = D.stream_iter(shards, args.batch_size, args.seq_len, steps_per_shard)
-        print(f"Dataset: EleutherAI/SmolLM2-135M-10B streamed across {n_shards} shard(s) offset={args.smollm2_offset} reuse={args.smollm2_reuse_cache}, {steps_per_shard} steps/shard (~10B tokens, 85 shards disk-friendly 3-4 at a time)")
+        if getattr(args, "smollm2_sliding", False):
+            # single-session sliding window: no phased save/resume, optimizer stays resident
+            data_iter = D.sliding_smolm2_iter(tokenizer, args.data_dir, args.batch_size, args.seq_len,
+                                              args.total_steps, window=args.smollm2_window, overlap=args.smollm2_overlap,
+                                              shuffle=not args.smollm2_no_shuffle, rng=np.random.default_rng(args.seed))
+            print(f"Dataset: EleutherAI/SmolLM2-135M-10B SLIDING window={args.smollm2_window} overlap={args.smollm2_overlap} (85 shards, single session, {args.total_steps} steps)")
+        else:
+            shards = D.ensure_smolm2_shards(tokenizer, args.data_dir, max_files=args.smollm2_max_files, offset=args.smollm2_offset, reuse_cache_slot=args.smollm2_reuse_cache)
+            n_shards = len(shards)
+            steps_per_shard = max(int(np.ceil(args.total_steps / max(n_shards, 1))), 1)
+            data_iter = D.stream_iter(shards, args.batch_size, args.seq_len, steps_per_shard)
+            print(f"Dataset: EleutherAI/SmolLM2-135M-10B streamed across {n_shards} shard(s) offset={args.smollm2_offset} reuse={args.smollm2_reuse_cache}, {steps_per_shard} steps/shard (~10B tokens, 85 shards disk-friendly 3-4 at a time)")
     elif args.synthetic:
         rngd = np.random.default_rng(args.seed)
         tokens = rngd.integers(0, cfg.vocab_size, size=100_000, dtype=np.uint16)
