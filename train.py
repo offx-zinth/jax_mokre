@@ -767,7 +767,7 @@ def main():
                 lr, tok_per_s, breakdown)
             t0 = time.time()
 
-        if step % args.ckpt_every == 0:
+        if step >= 80000 and step % args.ckpt_every == 0:
             save_state(os.path.join(args.out_dir, f"ckpt_{step}.pkl"), cfg,
                        params,
                        opt_state, step, rng)
