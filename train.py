@@ -50,18 +50,33 @@ from . import data as D
 
 
 def chunked_ce(cfg, Wt, hidden, labels, chunk):
-    """Cross-entropy over the vocab head, computed in seq-chunks to bound memory."""
+    """Cross-entropy over the vocab head, computed in seq-chunks to bound memory.
+
+    Uses lax.scan (traced ONCE) instead of a Python loop so XLA compile stays
+    bounded at 16k context (16 scan steps at chunk=1024 vs 128 unrolled bodies).
+    """
     B, S, H = hidden.shape
-    total = 0.0
-    denom = 0
-    for i in range(0, S, chunk):
-        h = hidden[:, i:i + chunk].reshape(-1, H)
-        y = labels[:, i:i + chunk].reshape(-1)
+    if S % chunk != 0:
+        # rare non-divisible S: fall back to full (single) CE
+        h = hidden.reshape(-1, H)
+        y = labels.reshape(-1)
         lg = jnp.einsum("nh,vh->nv", h, Wt)
         logp = jax.nn.log_softmax(lg, axis=-1)
-        total = total + (-jnp.sum(logp[jnp.arange(y.shape[0]), y]))
-        denom = denom + y.shape[0]
-    return total / denom
+        return -jnp.mean(logp[jnp.arange(y.shape[0]), y])
+    n = S // chunk
+    h_r = hidden.reshape(B, n, chunk, H).transpose(1, 0, 2, 3)  # (n,B,chunk,H)
+    y_r = labels.reshape(B, n, chunk).transpose(1, 0, 2)  # (n,B,chunk)
+
+    def _ce_step(_, elems):
+        h_c, y_c = elems
+        hf = h_c.reshape(-1, H)
+        yf = y_c.reshape(-1)
+        lg = jnp.einsum("nh,vh->nv", hf, Wt)
+        logp = jax.nn.log_softmax(lg, axis=-1)
+        return None, -jnp.sum(logp[jnp.arange(yf.shape[0]), yf])
+
+    _, nll_stack = jax.lax.scan(_ce_step, None, (h_r, y_r))
+    return jnp.sum(nll_stack) / (B * S)
 
 
 def make_loss_fn(cfg, ce_chunk, remat):
@@ -259,7 +274,8 @@ def build_config(args) -> MoREConfig:
             compute_dtype=getattr(args, "compute_dtype", "bfloat16"),
             max_seq_len=args.seq_len,
         )
-    # Engram on MSA recursion layer (idx 2) when requested: set engram_layers=[2]
+    # Engram layer: explicit --engram_layers wins; default MSA idx 2 (3:1).
+    # For 2:2 ["kda","kda","msa","msa"] pass --engram_layers 3 (2nd MSA).
     _engram_layers = getattr(args, "engram_layers", None)
     if isinstance(_engram_layers, str):
         _engram_layers = [int(x) for x in _engram_layers.split(",") if x.strip()!=""]
@@ -291,15 +307,32 @@ def build_config(args) -> MoREConfig:
                 print(f"  [dtype] TPU detected, auto compute_dtype=bfloat16 (override with --compute_dtype)")
         except Exception:
             pass
+    # --- 2:2 / 250M / constant-2k overrides (CLI, default = legacy 3:1 200M) ---
+    # --layer_pattern "kda,kda,msa,msa" gives 2:2 (2 KDA + 2 MSA). 2nd MSA = idx 3
+    #   -> use with --engram --engram_layers 3.
+    _lp = getattr(args, "layer_pattern", None)
+    if isinstance(_lp, str) and _lp.strip():
+        _layer_types = [t.strip().lower() for t in _lp.split(",") if t.strip()]
+        assert len(_layer_types) == 4 and set(_layer_types) <= {"kda", "msa", "mla"}, \
+            f"--layer_pattern must be 4 csv of kda/msa, got {_lp!r}"
+        _layer_types = ["msa" if t == "mla" else t for t in _layer_types]
+    else:
+        _layer_types = ["kda", "kda", "msa", "kda"]  # legacy 3:1
+    _kda_chunk = int(getattr(args, "kda_chunk_size", 512) or 512)
+    _msa_block = int(getattr(args, "msa_block_size", 128) or 128)
+    _msa_topk = int(getattr(args, "msa_topk", 16) or 16)
+    _msa_dim = int(getattr(args, "msa_index_dim", 128) or 128)
+    # constant-footprint guard: MSA budget = block*topk stays 2k at any seq_len
+    # (128*16=2048). KDA state is recurrent O(1) (B,NH,D) + chunked scan carry.
     if args.config == "tinystories":
         cfg = MoREConfig(
             vocab_size=50257, hidden_size=384, intermediate_size=768,
             num_attention_heads=6, num_key_value_heads=2, head_dim=64,
             max_seq_len=args.seq_len, max_recursion_depth=4,
             num_experts=8, num_local_experts=8, num_shared_experts=1, top_k=1,
-            router_hidden_size=64, kda_state_size=64, kda_chunk_size=512,
-            layer_types=["kda", "kda", "msa", "kda"],  # 3:1 KDA:MSA to reduce KV (MSA budget 2048)
-            msa_block_size=128, msa_topk=16, msa_index_dim=128, msa_kl_coef=0.02,  # budget 2048 = 128*16, dim 128 for precise block selection
+            router_hidden_size=64, kda_state_size=64, kda_chunk_size=_kda_chunk,
+            layer_types=list(_layer_types),
+            msa_block_size=_msa_block, msa_topk=_msa_topk, msa_index_dim=_msa_dim, msa_kl_coef=0.02,
             load_balancing_loss_coef=args.aux_coef, recursion_aux_coef=args.rec_aux_coef,
             rms_norm_eps=1e-6,
             initializer_range=0.02,
@@ -308,14 +341,22 @@ def build_config(args) -> MoREConfig:
             **engram_kw,
         )
     else:
+        # default 250M-class: H=1024, 16 heads, GQA 8 kv, inter=1072 -> ~250.5M params
+        # with 2:2 pattern (override via --intermediate_size / --layer_pattern).
+        _hidden = int(getattr(args, "hidden_size", None) or 1024)
+        _inter = int(getattr(args, "intermediate_size", None) or 768)
+        # H must stay heads*head_dim (16*64=1024); guard custom H
+        _nh, _nkv, _hd = 16, 8, 64
+        if _hidden == 1024:
+            _nh, _nkv, _hd = 16, 8, 64
         cfg = MoREConfig(
-            vocab_size=50257, hidden_size=1024, intermediate_size=768,
-            num_attention_heads=16, num_key_value_heads=8, head_dim=64,
+            vocab_size=50257, hidden_size=_hidden, intermediate_size=_inter,
+            num_attention_heads=_nh, num_key_value_heads=_nkv, head_dim=_hd,
             max_seq_len=args.seq_len, max_recursion_depth=4,
             num_experts=8, num_local_experts=8, num_shared_experts=1, top_k=2,
-            router_hidden_size=128, kda_state_size=64, kda_chunk_size=512,
-            layer_types=["kda", "kda", "msa", "kda"],  # 3:1 KDA:MSA to reduce KV (1 MSA × depth 4 = 4 passes, 33MB @16k vs 134MB for 4 MSA)
-            msa_block_size=128, msa_topk=16, msa_index_dim=128, msa_kl_coef=0.02,  # budget 2048 = 128*16, dim 128 for precise block selection
+            router_hidden_size=128, kda_state_size=64, kda_chunk_size=_kda_chunk,
+            layer_types=list(_layer_types),
+            msa_block_size=_msa_block, msa_topk=_msa_topk, msa_index_dim=_msa_dim, msa_kl_coef=0.02,
             load_balancing_loss_coef=args.aux_coef, recursion_aux_coef=args.rec_aux_coef,
             rms_norm_eps=1e-6,
             initializer_range=0.02,
@@ -329,8 +370,13 @@ def build_config(args) -> MoREConfig:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default="tinystories", choices=["tinystories", "default", "12b-3840", "12b-4096", "12b"])
-    ap.add_argument("--hidden_size", type=int, default=None, help="override hidden for 12b (3840 or 4096)")
-    ap.add_argument("--intermediate_size", type=int, default=None, help="override per-expert intermediate for 12b (default 1024)")
+    ap.add_argument("--hidden_size", type=int, default=None, help="override hidden (12b: 3840/4096; default: 1024)")
+    ap.add_argument("--intermediate_size", type=int, default=None, help="override per-expert intermediate (12b default 1024; default-config default 768; 1072 -> ~250M with 2:2)")
+    ap.add_argument("--layer_pattern", type=str, default=None, help="csv layer pattern, e.g. 'kda,kda,msa,msa' for 2:2 (default 3:1 kda,kda,msa,kda)")
+    ap.add_argument("--kda_chunk_size", type=int, default=512, help="KDA chunked-scan chunk (1024 for 16k keeps XLA unroll <=16)")
+    ap.add_argument("--msa_block_size", type=int, default=128, help="MSA block size Bk (128*16=2048 constant budget)")
+    ap.add_argument("--msa_topk", type=int, default=16, help="MSA top-k blocks (budget=Bk*topk=2048 constant at any seq_len)")
+    ap.add_argument("--msa_index_dim", type=int, default=128, help="MSA index dim")
     ap.add_argument("--dry_run", action="store_true", help="for 12b: only build config + count params, no training (no local training)")
     ap.add_argument("--seq_len", type=int, default=512, help="For TPU v5e compile: 1024 <3min, 2048 <5min, 4096 <10min, 8192 ~15-30min, 16384 >2h may hit idle timeout")
     ap.add_argument("--batch_size", type=int, default=16, help="Must divide #devices when using pmap (no mesh); with --mesh batch is global")
@@ -378,6 +424,11 @@ def main():
                     help="max files TOTAL across all smollm subsets (e.g. 10 for smoke)")
     ap.add_argument("--smollm_max_per_subset", type=int, default=None,
                      help="max files per subset (overrides total if set)")
+    ap.add_argument("--smollm_sliding", action="store_true",
+                     help="sliding window for smollm-corpus (cosmopedia-v2 104 shards): disk holds window shards only")
+    ap.add_argument("--smollm_window", type=int, default=4, help="sliding window size for smollm (default 4 ~4.4GB)")
+    ap.add_argument("--smollm_overlap", type=int, default=1, help="overlap shards kept across slide (default 1)")
+    ap.add_argument("--smollm_no_shuffle", action="store_true", help="disable shuffle for smollm sliding order")
     ap.add_argument("--smollm2", action="store_true",
                      help="train on EleutherAI/SmolLM2-135M-10B (85 shards, 10B tokens, data/train-*.parquet)")
     ap.add_argument("--smollm2_max_files", type=int, default=None,
@@ -586,7 +637,20 @@ def main():
             s = sum(weights)
             weights = [w/s for w in weights]
         print(f"Dataset: HuggingFaceTB/smollm-corpus subsets={subsets} weights={weights}")
-        if weights is not None and len(subsets) == 2:
+        if getattr(args, "smollm_sliding", False):
+            # sliding window for cosmopedia-v2 (104 shards, ~28B tokens): disk holds
+            # window shards only (~4x1.1GB=4.4GB), resume-aware via skip_steps=start_step.
+            _sub = subsets[0] if subsets else "cosmopedia-v2"
+            assert len(subsets) == 1, "--smollm_sliding requires single subset (use --smollm_subsets cosmopedia-v2)"
+            data_iter = D.sliding_smollm_iter(tokenizer, args.data_dir, _sub,
+                                              args.batch_size, args.seq_len,
+                                              args.total_steps, window=args.smollm_window,
+                                              overlap=args.smollm_overlap,
+                                              shuffle=not args.smollm_no_shuffle,
+                                              rng=np.random.default_rng(args.seed),
+                                              skip_steps=start_step)
+            print(f"Dataset: HuggingFaceTB/smollm-corpus SLIDING subset={_sub} window={args.smollm_window} overlap={args.smollm_overlap} (start_step={start_step}, total={args.total_steps} steps)")
+        elif weights is not None and len(subsets) == 2:
             # weighted mixture: download each subset's shards separately so weights matter
             shards_a = D.ensure_smollm_shards(tokenizer, args.data_dir,
                                               subsets=[subsets[0]],
@@ -629,11 +693,12 @@ def main():
               f"{steps_per_shard} steps/shard")
     elif args.smollm2:
         if getattr(args, "smollm2_sliding", False):
-            # single-session sliding window: no phased save/resume, optimizer stays resident
+            # sliding window with resume: skip to shard window containing start_step
             data_iter = D.sliding_smolm2_iter(tokenizer, args.data_dir, args.batch_size, args.seq_len,
                                               args.total_steps, window=args.smollm2_window, overlap=args.smollm2_overlap,
-                                              shuffle=not args.smollm2_no_shuffle, rng=np.random.default_rng(args.seed))
-            print(f"Dataset: EleutherAI/SmolLM2-135M-10B SLIDING window={args.smollm2_window} overlap={args.smollm2_overlap} (85 shards, single session, {args.total_steps} steps)")
+                                              shuffle=not args.smollm2_no_shuffle, rng=np.random.default_rng(args.seed),
+                                              skip_steps=start_step)
+            print(f"Dataset: EleutherAI/SmolLM2-135M-10B SLIDING window={args.smollm2_window} overlap={args.smollm2_overlap} (85 shards, start_step={start_step}, total={args.total_steps} steps)")
         else:
             shards = D.ensure_smolm2_shards(tokenizer, args.data_dir, max_files=args.smollm2_max_files, offset=args.smollm2_offset, reuse_cache_slot=args.smollm2_reuse_cache)
             n_shards = len(shards)
@@ -713,6 +778,20 @@ def main():
             print(f"  [compile heartbeat] {elapsed:.0f}s compiling... (TPU idle watchdog: still alive)", flush=True)
     _hb_thread = _th.Thread(target=_hb, daemon=True)
     _hb_thread.start()
+    # TPU keep-alive: Kaggle kills the TPU after 2h idle, and XLA compilation of
+    # a 16k-context step is host-side (TPU idle). Every 5 min run a trivial TPU
+    # op from THIS process (safe: same process that owns the TPU) to reset the
+    # idle watchdog. Stopped together with the heartbeat after the first step.
+    _stop_ka = _th.Event()
+    def _keepalive():
+        while not _stop_ka.wait(300):
+            try:
+                _t = jax.device_put(jnp.ones((32, 32), dtype=jnp.float32))
+                jax.block_until_ready(_t + 1)
+            except Exception:
+                pass
+    _ka_thread = _th.Thread(target=_keepalive, daemon=True)
+    _ka_thread.start()
     # No dummy compile — first real step will compile. Heartbeat will be stopped after first step completes.
 
     while step < args.total_steps:
@@ -739,6 +818,7 @@ def main():
         # Stop heartbeat after first successful compilation (first step may take 3-15min)
         if step == start_step:
             _stop_hb.set()
+            _stop_ka.set()
             print(f"  [compile] first step compiled in {time.time()-_compile_t0:.1f}s, heartbeat stopped", flush=True)
 
         loss_v = float(np.asarray(loss).mean())

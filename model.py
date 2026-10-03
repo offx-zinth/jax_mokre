@@ -179,31 +179,36 @@ def kda_forward(cfg, p, x, token_mask=None):
         # accA * s0_b[None] broadcasts correctly without S expansion
         s_t = accA * s0_b[:, None, :, :] + accW            # (B,S,NH,D)
     else:
-        # init carry: s0 repeated per batch
+        # Chunked scan via lax.scan (traced ONCE, no Python unroll).
+        # Keeps XLA compile bounded at long context: S=16384/chunk=2048 -> 8 steps.
+        # Require S divisible by chunk (all prod shapes are); else fall back below.
+        if S % chunk != 0:
+            # rare non-divisible S: single associative_scan (same as S<=chunk path)
+            accA, accW = jax.lax.associative_scan(_combine, (A, W), axis=1)
+            s0 = jnp.repeat(p["init_state"], G, axis=1)        # (1,NH,D)
+            s0_b = jnp.broadcast_to(s0, (bsz, NH, D))          # (B,NH,D)
+            s_t = accA * s0_b[:, None, :, :] + accW            # (B,S,NH,D)
+            out = (s_t * q).reshape(bsz, S, NH * D)
+            o_w_c = p["o_w"].astype(cd) if p["o_w"].dtype != cd else p["o_w"]
+            out_c = out.astype(cd) if out.dtype != cd else out
+            return lin(out_c, o_w_c).astype(x.dtype)
+        num = S // chunk
+        # (num, B, chunk, NH, D): scan over leading axis, no dynamic slicing
+        A_r = A.reshape(bsz, num, chunk, NH, D).transpose(1, 0, 2, 3, 4)
+        W_r = W.reshape(bsz, num, chunk, NH, D).transpose(1, 0, 2, 3, 4)
+        q_r = q.reshape(bsz, num, chunk, NH, D).transpose(1, 0, 2, 3, 4)
         s0_init = jnp.repeat(p["init_state"], G, axis=1)  # (1,NH,D)
-        carry = jnp.broadcast_to(s0_init, (bsz, NH, D))  # (B,NH,D)
-        # collect outputs in list (still Python loop over chunks, bounded memory per chunk)
-        out_parts = []
-        for start in range(0, S, chunk):
-            end = start + chunk
-            if end > S:
-                end = S
-            A_chunk = A[:, start:end, :, :]  # (B,C,NH,D)
-            W_chunk = W[:, start:end, :, :]
-            q_chunk = q[:, start:end, :, :]
-            # scan within chunk
-            accA_c, accW_c = jax.lax.associative_scan(_combine, (A_chunk, W_chunk), axis=1)
-            # incorporate carry: s = accA * carry + accW
-            carry_b = carry[:, None, :, :]  # (B,1,NH,D)
-            s_chunk = accA_c * carry_b + accW_c  # (B,C,NH,D)
-            out_chunk = s_chunk * q_chunk
-            out_parts.append(out_chunk)
-            # update carry to last state of chunk
-            carry = s_chunk[:, -1, :, :]  # (B,NH,D)
-        s_t = jnp.concatenate(out_parts, axis=1)  # (B,S,NH,D) for compatibility
-        # s_t already is out before final multiply? we used out_parts as s*q
-        # to keep same API, set s_t to concatenated s*q pre-projection
-        out = s_t.reshape(bsz, S, NH * D)
+        carry0 = jnp.broadcast_to(s0_init, (bsz, NH, D))  # (B,NH,D)
+
+        def _kda_chunk_step(carry, elems):
+            A_c, W_c, q_c = elems  # each (B,chunk,NH,D)
+            accA_c, accW_c = jax.lax.associative_scan(_combine, (A_c, W_c), axis=1)
+            s_c = accA_c * carry[:, None, :, :] + accW_c  # (B,C,NH,D)
+            return s_c[:, -1, :, :], s_c * q_c  # carry (B,NH,D), out (B,C,NH,D)
+
+        _, outs = jax.lax.scan(_kda_chunk_step, carry0, (A_r, W_r, q_r))
+        # outs: (num,B,C,NH,D) -> (B,S,NH*D), already s*q (same as old out_parts)
+        out = outs.transpose(1, 0, 2, 3, 4).reshape(bsz, S, NH * D)
         o_w_c = p["o_w"].astype(cd) if p["o_w"].dtype != cd else p["o_w"]
         out_c = out.astype(cd) if out.dtype != cd else out
         return lin(out_c, o_w_c).astype(x.dtype)
@@ -409,37 +414,55 @@ def msa_forward(cfg, p, x, attention_mask=None, token_mask=None, training=False)
     k_eff = k_req if k_req <= Nb else Nb
     if k_eff < 1:
         k_eff = 1
-    # Compute M = block-max of index scores without full S_idx
-    # M shape (B,NG,S,Nb) via key-block loop
-    # For compile bound, if Nb > 64 (S>8192) we compute in blocks of 8
+    # Compute M = block-max of index scores without full S_idx.
+    # M shape (B,NG,S,Nb) via lax.scan over key blocks (traced ONCE, no unroll).
+    # Keys are statically padded to Nb*Bk so every block has uniform shape.
     q_idx_t = jnp.transpose(q_idx, (0, 2, 1, 3))  # (B,NG,S,d_idx)
-    M = jnp.full((B, NG, S, Nb), -1e30, dtype=x.dtype)
-    # key block loop (Nb <= 128 for S=8192, 64 blocks at 8k)
-    for b in range(Nb):
-        start = b * Bk
-        end = start + Bk
-        if end > S:
-            end = S
-        Bk_eff = end - start
-        if Bk_eff <= 0:
-            continue
-        k_block = k_idx[:, start:end, :]  # (B,Bk_eff,d_idx)
-        scores_block = jnp.einsum("bgid,bjd->bgij", q_idx_t, k_block) * idx_scale  # (B,NG,S,Bk_eff)
-        # causal: j_global = start + j_local <= i
-        q_pos = jnp.arange(S)[:, None]  # (S,1)
-        k_pos = jnp.arange(start, end)[None, :]  # (1,Bk_eff)
-        causal_block = (k_pos <= q_pos)  # (S,Bk_eff)
+    key_pad = Nb * Bk - S
+    if key_pad > 0:
+        _zp = jnp.zeros((B, key_pad, d_idx), dtype=k_idx.dtype)
+        k_idx_p = jnp.concatenate([k_idx, _zp], axis=1)  # (B,Nb*Bk,d_idx)
+    else:
+        k_idx_p = k_idx
+    if attention_mask is not None:
+        key_valid = (attention_mask != 0)  # (B,S)
+        if key_pad > 0:
+            key_valid = jnp.concatenate(
+                [key_valid, jnp.zeros((B, key_pad), dtype=bool)], axis=1)
+    else:
+        key_valid = None
+    if token_mask is not None:
+        key_active = (token_mask != 0)  # (B,S)
+        if key_pad > 0:
+            key_active = jnp.concatenate(
+                [key_active, jnp.zeros((B, key_pad), dtype=bool)], axis=1)
+    else:
+        key_active = None
+    # (Nb,B,Bk,d_idx): scan over leading axis, no dynamic slicing
+    k_blocks = k_idx_p.reshape(B, Nb, Bk, d_idx).transpose(1, 0, 2, 3)
+    q_pos_all = jnp.arange(S)[:, None]  # (S,1)
+    _ar_bk = jnp.arange(Bk)[None, :]  # (1,Bk)
+
+    # NOTE: causal/valid masking needs the block index; scan over b instead
+    def _block_step(_, b):
+        k_block = k_blocks[b]  # (B,Bk,d_idx), dynamic index (no unroll)
+        scores_block = jnp.einsum("bgid,bjd->bgij", q_idx_t, k_block) * idx_scale
+        # causal: j_global = b*Bk + j_local <= i
+        k_pos = (b * Bk + _ar_bk)  # (1,Bk) traced
+        # padded tail keys (j_global >= S) are never valid: force -inf
+        in_range = (b * Bk + _ar_bk) < S  # (1,Bk)
+        causal_block = jnp.logical_and((k_pos <= q_pos_all), in_range)  # (S,Bk)
         scores_block = jnp.where(causal_block[None, None, :, :], scores_block, -1e30)
-        if attention_mask is not None:
-            key_valid = (attention_mask != 0)  # (B,S)
-            valid_block = key_valid[:, start:end]  # (B,Bk_eff)
-            scores_block = jnp.where(valid_block[:, None, None, :], scores_block, -1e30)
-        if token_mask is not None:
-            key_active = (token_mask != 0)  # (B,S)
-            active_block = key_active[:, start:end]  # (B,Bk_eff)
-            scores_block = jnp.where(active_block[:, None, None, :], scores_block, -1e30)
-        block_max = jnp.max(scores_block, axis=-1)  # (B,NG,S)
-        M = M.at[:, :, :, b].set(block_max)
+        if key_valid is not None:
+            vb = key_valid.reshape(B, Nb, Bk)[:, b, :]  # (B,Bk) dynamic
+            scores_block = jnp.where(vb[:, None, None, :], scores_block, -1e30)
+        if key_active is not None:
+            ab = key_active.reshape(B, Nb, Bk)[:, b, :]  # (B,Bk) dynamic
+            scores_block = jnp.where(ab[:, None, None, :], scores_block, -1e30)
+        return None, jnp.max(scores_block, axis=-1)  # (B,NG,S)
+
+    _, M_blocks = jax.lax.scan(_block_step, None, jnp.arange(Nb))
+    M = M_blocks.transpose(1, 2, 3, 0)  # (Nb,B,NG,S) -> (B,NG,S,Nb)
 
     _, top_idx = jax.lax.top_k(M, k_eff)  # (B,NG,S,k_eff)
     # force local block
@@ -450,42 +473,55 @@ def msa_forward(cfg, p, x, attention_mask=None, token_mask=None, training=False)
     replace_pos = jnp.logical_and(jnp.logical_not(is_in)[..., None], is_last)
     top_idx = jnp.where(replace_pos, local_bc[..., None], top_idx)
 
-    # Main branch: query-chunked sparse attention
+    # Main branch: query-chunked sparse attention via lax.scan (traced ONCE).
+    # S=16384/CQ=512 -> 32 scan steps instead of 128 unrolled chunk bodies.
     k_rep = jnp.repeat(k_main, G, axis=2)  # (B,S,NH,D)
     v_rep = jnp.repeat(v_main, G, axis=2)  # (B,S,NH,D)
-    CQ = 128  # query chunk to bound memory
-    # For KL accumulation
-    kl_sum = jnp.asarray(0.0, dtype=x.dtype)
-    valid_sum = jnp.asarray(0, dtype=jnp.int32)
-    out_chunks = []
+    # CQ: largest divisor of S from candidates (static choice at trace time)
+    _CQ_CANDS = (1024, 512, 256, 128)
+    CQ = next((c for c in _CQ_CANDS if S % c == 0), S)
+    nC = S // CQ
+    C = CQ
+    # Pre-chunk queries/index/masks to (nC, B, C, ...): scan over leading axis
+    qC = q_main.reshape(B, nC, C, NH, D).transpose(1, 0, 2, 3, 4)  # (nC,B,C,NH,D)
+    topC = top_idx.reshape(B, NG, nC, C, k_eff).transpose(2, 0, 1, 3, 4)  # (nC,B,NG,C,k)
+    qidxC = q_idx.reshape(B, S, NG, d_idx).reshape(
+        B, nC, C, NG, d_idx).transpose(1, 0, 2, 3, 4)  # (nC,B,C,NG,d_idx)
+    if attention_mask is not None:
+        qattC = (attention_mask != 0).reshape(B, nC, C).transpose(1, 0, 2)  # (nC,B,C)
+    else:
+        qattC = None
+    if token_mask is not None:
+        qtokC = (token_mask != 0).reshape(B, nC, C).transpose(1, 0, 2)  # (nC,B,C)
+    else:
+        qtokC = None
     # Precompute block_id for mask building
     block_id = jnp.arange(S) // Bk  # (S,)
-    for qs in range(0, S, CQ):
-        qe = qs + CQ
-        if qe > S:
-            qe = S
-        C = qe - qs
-        q_chunk = q_main[:, qs:qe, :, :]  # (B,C,NH,D)
-        # scores chunk: (B,NH,C,S)
-        scores_chunk = jnp.einsum("bqhd,bthd->bhqt", q_chunk, k_rep)
-        # selected mask for chunk: (B,NG,C,S)
-        top_idx_chunk = top_idx[:, :, qs:qe, :]  # (B,NG,C,k_eff)
+    block_id_b = block_id.reshape(1, 1, 1, -1)  # (1,1,1,S)
+    k_pos_all = jnp.arange(S)[None, :]  # (1,S)
+    _ar_C = jnp.arange(C)  # (C,)
+    if attention_mask is not None:
+        key_valid_exp = (attention_mask != 0)[:, None, None, :]  # (B,1,1,S)
+    if token_mask is not None:
+        key_active_exp = (token_mask != 0)[:, None, None, :]  # (B,1,1,S)
+
+    def _msa_chunk_step(_, elems):
+        c, q_chunk, top_idx_chunk, q_idx_c, q_valid_c, q_active_c = elems
+        # q_chunk (B,C,NH,D); top_idx_chunk (B,NG,C,k_eff); q_idx_c (B,C,NG,d_idx)
+        scores_chunk = jnp.einsum("bqhd,bthd->bhqt", q_chunk, k_rep)  # (B,NH,C,S)
+        # selected mask for chunk: (B,NG,C,S); ki loop (<=16) unrolled once in body
         sel_mask_chunk = jnp.zeros((B, NG, C, S), dtype=bool)
-        block_id_b = block_id.reshape(1, 1, 1, -1)  # (1,1,1,S)
         for ki in range(k_eff):
             blk = top_idx_chunk[..., ki]  # (B,NG,C)
             mask_k = (blk[..., None] == block_id_b)  # (B,NG,C,S)
             sel_mask_chunk = jnp.logical_or(sel_mask_chunk, mask_k)
-        # causal for chunk: query pos = qs + cq_idx
-        q_pos_chunk = jnp.arange(qs, qe)[:, None]  # (C,1)
-        k_pos = jnp.arange(S)[None, :]  # (1,S)
-        causal_chunk = (k_pos <= q_pos_chunk)  # (C,S)
+        # causal for chunk: query pos = c*C + cq_idx (c traced, arithmetic OK)
+        q_pos_chunk = (c * C + _ar_C)[:, None]  # (C,1)
+        causal_chunk = (k_pos_all <= q_pos_chunk)  # (C,S)
         sel_mask_chunk = jnp.logical_and(sel_mask_chunk, causal_chunk[None, None, :, :])
         if attention_mask is not None:
-            key_valid_exp = (attention_mask != 0)[:, None, None, :]  # (B,1,1,S)
             sel_mask_chunk = jnp.logical_and(sel_mask_chunk, key_valid_exp)
         if token_mask is not None:
-            key_active_exp = (token_mask != 0)[:, None, None, :]  # (B,1,1,S)
             sel_mask_chunk = jnp.logical_and(sel_mask_chunk, key_active_exp)
         # attention over selected blocks only
         allowed_chunk = jnp.repeat(sel_mask_chunk, G, axis=1)  # (B,NH,C,S)
@@ -493,13 +529,12 @@ def msa_forward(cfg, p, x, attention_mask=None, token_mask=None, training=False)
         scores_shifted = scores_masked - jnp.max(scores_masked, axis=-1, keepdims=True)
         probs_chunk = jax.nn.softmax(scores_shifted, axis=-1)  # (B,NH,C,S)
         out_chunk = jnp.einsum("bhqt,bthd->bqhd", probs_chunk, v_rep)  # (B,C,NH,D)
-        out_chunks.append(out_chunk)
 
+        kl_c = jnp.asarray(0.0, dtype=x.dtype)
+        valid_c = jnp.asarray(0, dtype=jnp.int32)
         if training:
-            # KL for this chunk
-            q_idx_chunk_t = jnp.transpose(q_idx[:, qs:qe, :, :], (0, 2, 1, 3))  # (B,NG,C,d_idx)
-            S_idx_chunk = jnp.einsum("bgid,bjd->bgij", q_idx_chunk_t, k_idx) * idx_scale  # (B,NG,C,S)
-            # S_idx already causal/valid masked via sel_mask; for P_idx we re-mask to selected
+            q_idx_chunk_t = jnp.transpose(q_idx_c, (0, 2, 1, 3))  # (B,NG,C,d_idx)
+            S_idx_chunk = jnp.einsum("bgid,bjd->bgij", q_idx_chunk_t, k_idx) * idx_scale
             S_idx_kl = jnp.where(sel_mask_chunk, S_idx_chunk, -1e30)  # (B,NG,C,S)
             max_idx_kl = jnp.max(S_idx_kl, axis=-1, keepdims=True)  # (B,NG,C,1)
             exp_idx = jnp.where(sel_mask_chunk, jnp.exp(S_idx_kl - max_idx_kl), 0.0)
@@ -517,23 +552,31 @@ def msa_forward(cfg, p, x, attention_mask=None, token_mask=None, training=False)
             P_teacher = jax.lax.stop_gradient(P_teacher)
             has_valid = jnp.any(sel_mask_chunk, axis=-1)  # (B,NG,C)
             if attention_mask is not None:
-                q_valid = (attention_mask != 0)[:, qs:qe]  # (B,C)
-                q_valid_bc = jnp.broadcast_to(q_valid[:, None, :], (B, NG, C))
+                q_valid_bc = jnp.broadcast_to(q_valid_c[:, None, :], (B, NG, C))
                 has_valid = jnp.logical_and(has_valid, q_valid_bc)
             if token_mask is not None:
-                q_active = (token_mask != 0)[:, qs:qe]  # (B,C)
-                q_active_bc = jnp.broadcast_to(q_active[:, None, :], (B, NG, C))
+                q_active_bc = jnp.broadcast_to(q_active_c[:, None, :], (B, NG, C))
                 has_valid = jnp.logical_and(has_valid, q_active_bc)
-            kl_per = jnp.sum(P_teacher * (jnp.log(P_teacher + 1e-9) - jnp.log(P_idx + 1e-9)), axis=-1)  # (B,NG,C)
+            kl_per = jnp.sum(P_teacher * (jnp.log(P_teacher + 1e-9) - jnp.log(P_idx + 1e-9)), axis=-1)
             kl_per = jnp.where(has_valid, kl_per, 0.0)
-            kl_sum = kl_sum + jnp.sum(kl_per)
-            valid_sum = valid_sum + jnp.sum(has_valid.astype(jnp.int32))
+            kl_c = jnp.sum(kl_per)
+            valid_c = jnp.sum(has_valid.astype(jnp.int32))
+        return None, (out_chunk, kl_c, valid_c)
 
-    out_concat = jnp.concatenate(out_chunks, axis=1)  # (B,S,NH,D)
+    _c_idx = jnp.arange(nC)
+    # masks absent -> dummy closed-over constants (body branches on static training/None)
+    _qv = qattC if qattC is not None else jnp.ones((nC, B, C), dtype=bool)
+    _qt = qtokC if qtokC is not None else jnp.ones((nC, B, C), dtype=bool)
+    _, (out_stack, kl_stack, valid_stack) = jax.lax.scan(
+        _msa_chunk_step, None, (_c_idx, qC, topC, qidxC, _qv, _qt))
+    # out_stack (nC,B,C,NH,D) -> (B,S,NH,D); kl/valid reduced over chunks
+    out_concat = out_stack.transpose(1, 0, 2, 3, 4).reshape(B, S, NH, D)
     out_concat = out_concat.reshape(B, S, NH * D)
     out_proj = lin(out_concat, p["o_w"])
     aux = jnp.asarray(0.0, dtype=out_proj.dtype)
     if training:
+        kl_sum = jnp.sum(kl_stack)
+        valid_sum = jnp.sum(valid_stack)
         denom = jnp.maximum(valid_sum, 1)
         kl_loss = kl_sum / denom
         aux = cfg.msa_kl_coef * kl_loss

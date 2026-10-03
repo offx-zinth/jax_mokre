@@ -498,14 +498,17 @@ def _ensure_smolm2_one(tokenizer, data_dir: str, fname: str, global_idx: int, fo
 
 
 def sliding_smolm2_iter(tokenizer, data_dir: str, batch_size: int, seq_len: int, total_steps: int,
-                        window: int = 4, overlap: int = 1, shuffle: bool = True, rng=None):
-    """Sliding overlapped-window iterator for 85-shard SmolLM2 — single session, no resume.
+                        window: int = 4, overlap: int = 1, shuffle: bool = True, rng=None, skip_steps: int = 0):
+    """Sliding overlapped-window iterator for 85-shard SmolLM2 — resume-aware.
 
     Keeps optimizer/params resident in one process. Disk holds at most `window` .npy
     files (std smollm2_shard{i}.npy); oldest is deleted as window slides — so peak
     disk ~ window*0.6GB. Overlap keeps `overlap` shards from previous window in the
     mixture for continuity (loss plateau break). Yields indefinitely until caller
     stops at total_steps.
+    skip_steps: resume offset (= start_step from ckpt). Fast-forwards perm window
+    to the slide containing skip_steps (floored to slide boundary) so training
+    restarts from the shard it left, not from shard 0.
     """
     import collections
     os.makedirs(data_dir, exist_ok=True)
@@ -515,21 +518,35 @@ def sliding_smolm2_iter(tokenizer, data_dir: str, batch_size: int, seq_len: int,
         rng = np.random.default_rng(0)
     perm = rng.permutation(n) if shuffle else np.arange(n)
     steps_per_shard = max(total_steps // max(n, 1), 1)
-    print(f"[sliding] window={window} overlap={overlap} n={n} steps_per_shard={steps_per_shard} total_steps={total_steps} shuffle={shuffle}")
+    drop_n = max((window - overlap), 1)
+    advance_every = drop_n * steps_per_shard
+    print(f"[sliding] window={window} overlap={overlap} n={n} steps_per_shard={steps_per_shard} total_steps={total_steps} shuffle={shuffle} skip_steps={skip_steps}")
     # deque of (global_idx, mmap array)
     dq: collections.deque = collections.deque()
+    # resume: fast-forward to slide containing skip_steps (floored)
+    _skip_floor = 0
+    _start_pos = 0
+    if skip_steps and skip_steps > 0:
+        num_slides = skip_steps // max(advance_every, 1)
+        _start_pos = int(num_slides * drop_n)
+        # clamp so window fits in 85
+        if _start_pos + window > n:
+            _start_pos = max(0, n - window)
+            num_slides = _start_pos // max(drop_n, 1)
+        _skip_floor = int(num_slides * advance_every)
+        print(f"  [sliding-resume] skip_steps={skip_steps} -> start_pos={_start_pos} next_ptr={_start_pos+window}/{n} emitted_floor={_skip_floor} (repeat {skip_steps-_skip_floor} steps in current window)")
     # sequential sliding: for each position pos in perm order, ensure that shard,
     # push to dq, and when dq exceeds window, drop oldest file from disk.
     # Within a window we interleave batches round-robin across shards in dq.
-    next_ptr = 0
-    # preload first window
-    for _ in range(min(window, n)):
+    next_ptr = _start_pos
+    # preload window at resume position (or first window on fresh start)
+    for _ in range(min(window, n - _start_pos)):
         gi = int(perm[next_ptr]); fname = files[gi]
         arr = _ensure_smolm2_one(tokenizer, data_dir, fname, gi)
         dq.append((gi, arr))
         next_ptr += 1
-    print(f"  [sliding] preloaded window {[g for g,_ in dq]}")
-    emitted = 0
+    print(f"  [sliding] preloaded window {[g for g,_ in dq]} (start_pos={_start_pos})")
+    emitted = _skip_floor
     # round-robin iterators per shard in window
     iters = [make_iter(arr, batch_size, seq_len, rng) for _, arr in dq]
     while emitted < total_steps:
@@ -595,6 +612,138 @@ def sliding_smolm2_iter(tokenizer, data_dir: str, batch_size: int, seq_len: int,
                 next_ptr += 1
             iters = [make_iter(arr, batch_size, seq_len, rng) for _, arr in dq]
             print(f"  [sliding] epoch wrap -> new window {[g for g,_ in dq]}")
+
+
+def _ensure_smollm_one(tokenizer, data_dir: str, subset: str, fname: str, global_idx: int, force: bool = False) -> np.ndarray:
+    """Download+tokenize single smollm-corpus shard -> smollm_{subset}_shard{global_idx}.npy (mmap)."""
+    assert subset in SMOLLM_SUBSETS, subset
+    cache = os.path.join(data_dir, f"smollm_{subset}_shard{global_idx}.npy")
+    if os.path.exists(cache) and not force:
+        arr = np.load(cache, mmap_mode="r")
+        print(f"  [sliding-smollm] {subset}/{os.path.basename(fname)}: cached {arr.shape[0]:,} tokens -> {cache}")
+        return arr
+    nl = tokenizer.encode("\n", add_special_tokens=False)[0]
+    p = hf_hub_download(REPO_SMOLLM, fname, repo_type="dataset", cache_dir=data_dir)
+    try:
+        nrows = pq.read_metadata(p).num_rows
+        cap = nrows * 800 + 1_000_000  # ~800 tok/doc for edu web/textbook
+        arr = np.empty(cap, dtype=np.uint16)
+        pos = 0
+        table = pq.read_table(p, columns=["text"])
+        texts = table["text"].to_pylist()
+        bs = 512
+        for b in range(0, len(texts), bs):
+            enc = tokenizer(texts[b:b+bs], add_special_tokens=False)["input_ids"]
+            for ids in enc:
+                n = len(ids); need = pos + n + 1
+                if need > arr.shape[0]:
+                    arr = _ensure_capacity(arr, need)
+                arr[pos:pos+n] = np.asarray(ids, dtype=np.uint16); pos += n; arr[pos] = nl; pos += 1
+        cap_now = arr.shape[0]; arr = arr[:pos]; np.save(cache, arr)
+        print(f"  [sliding-smollm] {subset}/{os.path.basename(fname)}: tokenized {pos:,} tokens cap {cap_now:,} util {pos/cap_now*100:.1f}%")
+        arr = np.load(cache, mmap_mode="r")
+    finally:
+        try:
+            if os.path.exists(p):
+                os.remove(p)
+        except Exception:
+            pass
+    return arr
+
+
+def sliding_smollm_iter(tokenizer, data_dir: str, subset: str, batch_size: int, seq_len: int, total_steps: int,
+                        window: int = 4, overlap: int = 1, shuffle: bool = True, rng=None, skip_steps: int = 0):
+    """Sliding overlapped-window iterator for smollm-corpus single subset — resume-aware.
+
+    Same protocol as sliding_smolm2_iter but over list_smollm(subset) (e.g.
+    cosmopedia-v2 104 shards, ~28B GPT-2 tokens, ~1.1GB npy/shard). Disk holds at
+    most `window` .npy files (default 4 -> ~4.4GB); oldest are deleted as the
+    window slides. Overlap keeps `overlap` shards for continuity.
+    skip_steps (= start_step from ckpt) fast-forwards to the slide containing it.
+    """
+    import collections
+    assert subset in SMOLLM_SUBSETS, subset
+    os.makedirs(data_dir, exist_ok=True)
+    files = list_smollm(subset)
+    n = len(files)
+    if rng is None:
+        rng = np.random.default_rng(0)
+    perm = rng.permutation(n) if shuffle else np.arange(n)
+    steps_per_shard = max(total_steps // max(n, 1), 1)
+    drop_n = max((window - overlap), 1)
+    advance_every = drop_n * steps_per_shard
+    print(f"[sliding-smollm] subset={subset} window={window} overlap={overlap} n={n} steps_per_shard={steps_per_shard} total_steps={total_steps} shuffle={shuffle} skip_steps={skip_steps}")
+    dq: collections.deque = collections.deque()
+    _skip_floor = 0
+    _start_pos = 0
+    if skip_steps and skip_steps > 0:
+        num_slides = skip_steps // max(advance_every, 1)
+        _start_pos = int(num_slides * drop_n)
+        if _start_pos + window > n:
+            _start_pos = max(0, n - window)
+            num_slides = _start_pos // max(drop_n, 1)
+        _skip_floor = int(num_slides * advance_every)
+        print(f"  [sliding-smollm-resume] skip_steps={skip_steps} -> start_pos={_start_pos} next_ptr={_start_pos+window}/{n} emitted_floor={_skip_floor}")
+    next_ptr = _start_pos
+    for _ in range(min(window, n - _start_pos)):
+        gi = int(perm[next_ptr]); fname = files[gi]
+        arr = _ensure_smollm_one(tokenizer, data_dir, subset, fname, gi)
+        dq.append((gi, arr))
+        next_ptr += 1
+    print(f"  [sliding-smollm] preloaded window {[g for g, _ in dq]} (start_pos={_start_pos})")
+    emitted = _skip_floor
+    iters = [make_iter(arr, batch_size, seq_len, rng) for _, arr in dq]
+    while emitted < total_steps:
+        for wi in range(len(dq)):
+            if emitted >= total_steps:
+                break
+            it = iters[wi]
+            yield next(it)
+            emitted += 1
+            advance_every = max((window - overlap), 1) * steps_per_shard
+            if emitted % advance_every == 0 and next_ptr < n:
+                drop_n = window - overlap
+                for _ in range(drop_n):
+                    if dq:
+                        old_gi, old_arr = dq.popleft()
+                        iters.pop(0)
+                        try:
+                            del old_arr
+                        except Exception:
+                            pass
+                        old_cache = os.path.join(data_dir, f"smollm_{subset}_shard{old_gi}.npy")
+                        try:
+                            if os.path.exists(old_cache):
+                                os.remove(old_cache)
+                                print(f"  [sliding-smollm] cleaned shard {old_gi} -> {old_cache} ({emitted}/{total_steps} steps)")
+                        except Exception as e:
+                            print(f"  [sliding-smollm] warning clean {old_gi}: {e}")
+                for _ in range(drop_n):
+                    if next_ptr >= n:
+                        break
+                    gi = int(perm[next_ptr]); fname = files[gi]
+                    arr = _ensure_smollm_one(tokenizer, data_dir, subset, fname, gi)
+                    dq.append((gi, arr))
+                    iters.append(make_iter(arr, batch_size, seq_len, rng))
+                    next_ptr += 1
+                print(f"  [sliding-smollm] window slid -> {[g for g, _ in dq]} next_ptr={next_ptr}/{n}")
+                try:
+                    import glob as _g, shutil as _sh
+                    for d in _g.glob(os.path.join(data_dir, ".cache")):
+                        _sh.rmtree(d, ignore_errors=True)
+                except Exception:
+                    pass
+                break
+        if next_ptr >= n and emitted < total_steps and len(dq) == 0:
+            perm = rng.permutation(n) if shuffle else np.arange(n)
+            next_ptr = 0
+            for _ in range(min(window, n)):
+                gi = int(perm[next_ptr]); fname = files[gi]
+                arr = _ensure_smollm_one(tokenizer, data_dir, subset, fname, gi)
+                dq.append((gi, arr))
+                next_ptr += 1
+            iters = [make_iter(arr, batch_size, seq_len, rng) for _, arr in dq]
+            print(f"  [sliding-smollm] epoch wrap -> new window {[g for g, _ in dq]}")
 
 
 def mixture_stream_iter(shards_a: list[np.ndarray], shards_b: list[np.ndarray],
