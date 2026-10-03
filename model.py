@@ -505,8 +505,13 @@ def msa_forward(cfg, p, x, attention_mask=None, token_mask=None, training=False)
     if token_mask is not None:
         key_active_exp = (token_mask != 0)[:, None, None, :]  # (B,1,1,S)
 
-    def _msa_chunk_step(_, elems):
-        c, q_chunk, top_idx_chunk, q_idx_c, q_valid_c, q_active_c = elems
+    # Per-chunk compute (plain function). Called under jax.remat from the scan
+    # step below so AD saves only (inputs, out/kl/valid) per step and RECOMPUTES
+    # the ~1GB scores/teacher intermediates on backward. Without remat, scan's
+    # linearize stacks every body intermediate across all chunks (17GB scores +
+    # 8GB masks x several live copies -> 720GB HBM blowup at 16k).
+    def _msa_chunk_compute(c, q_chunk, top_idx_chunk, q_idx_c, q_valid_c,
+                           q_active_c):
         # q_chunk (B,C,NH,D); top_idx_chunk (B,NG,C,k_eff); q_idx_c (B,C,NG,d_idx)
         scores_chunk = jnp.einsum("bqhd,bthd->bhqt", q_chunk, k_rep)  # (B,NH,C,S)
         # selected mask for chunk: (B,NG,C,S); ki loop (<=16) unrolled once in body
@@ -561,7 +566,14 @@ def msa_forward(cfg, p, x, attention_mask=None, token_mask=None, training=False)
             kl_per = jnp.where(has_valid, kl_per, 0.0)
             kl_c = jnp.sum(kl_per)
             valid_c = jnp.sum(has_valid.astype(jnp.int32))
-        return None, (out_chunk, kl_c, valid_c)
+        return out_chunk, kl_c, valid_c
+
+    _msa_chunk_compute_ckpt = jax.remat(_msa_chunk_compute)
+
+    def _msa_chunk_step(_, elems):
+        c, q_chunk, top_idx_chunk, q_idx_c, q_valid_c, q_active_c = elems
+        return None, _msa_chunk_compute_ckpt(
+            c, q_chunk, top_idx_chunk, q_idx_c, q_valid_c, q_active_c)
 
     _c_idx = jnp.arange(nC)
     # masks absent -> dummy closed-over constants (body branches on static training/None)

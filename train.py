@@ -67,13 +67,19 @@ def chunked_ce(cfg, Wt, hidden, labels, chunk):
     h_r = hidden.reshape(B, n, chunk, H).transpose(1, 0, 2, 3)  # (n,B,chunk,H)
     y_r = labels.reshape(B, n, chunk).transpose(1, 0, 2)  # (n,B,chunk)
 
-    def _ce_step(_, elems):
-        h_c, y_c = elems
+    # remat: the (chunk, V) logits/logp (100MB+ at 16k) are recomputed on
+    # backward instead of stacked across chunks by scan's linearize.
+    @jax.remat
+    def _ce_compute(h_c, y_c):
         hf = h_c.reshape(-1, H)
         yf = y_c.reshape(-1)
         lg = jnp.einsum("nh,vh->nv", hf, Wt)
         logp = jax.nn.log_softmax(lg, axis=-1)
-        return None, -jnp.sum(logp[jnp.arange(yf.shape[0]), yf])
+        return -jnp.sum(logp[jnp.arange(yf.shape[0]), yf])
+
+    def _ce_step(_, elems):
+        h_c, y_c = elems
+        return None, _ce_compute(h_c, y_c)
 
     _, nll_stack = jax.lax.scan(_ce_step, None, (h_r, y_r))
     return jnp.sum(nll_stack) / (B * S)
