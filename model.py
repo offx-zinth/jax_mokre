@@ -477,8 +477,9 @@ def msa_forward(cfg, p, x, attention_mask=None, token_mask=None, training=False)
     # S=16384/CQ=512 -> 32 scan steps instead of 128 unrolled chunk bodies.
     k_rep = jnp.repeat(k_main, G, axis=2)  # (B,S,NH,D)
     v_rep = jnp.repeat(v_main, G, axis=2)  # (B,S,NH,D)
-    # CQ: largest divisor of S from candidates (static choice at trace time)
-    _CQ_CANDS = (1024, 512, 256, 128)
+    # CQ: largest divisor of S from candidates (static choice at trace time).
+    # 512 -> per-chunk scores (B,NH,512,S) ~= 0.5GB transient (was 1GB at 1024).
+    _CQ_CANDS = (512, 256, 128)
     CQ = next((c for c in _CQ_CANDS if S % c == 0), S)
     nC = S // CQ
     C = CQ
@@ -1245,7 +1246,14 @@ def forward(cfg, params, input_ids, training=False, attention_mask=None, return_
     if use_global_engram:
         h = h + engram_forward(cfg, params["engram"], h, input_ids)
 
-    h, a1 = mor_layer(cfg, params["first"], h, "kda", training=training)
+    # Per-layer remat (HBM): each attention/MoE layer is recomputed on backward,
+    # so only per-layer INPUT activations (~33MB @16k) stay live across the
+    # depth-unrolled block instead of every layer's internals at once (35GB).
+    # Exact (deterministic layers, no dropout). Training path only.
+    _ckpt_mor = jax.remat(mor_layer, static_argnums=(0, 3, 6))
+    _ckpt_moe = jax.remat(moe_forward, static_argnums=(0, 3))
+
+    h, a1 = _ckpt_mor(cfg, params["first"], h, "kda", None, attention_mask, training)
     router_out = router_forward(cfg, params["router"], h, training)
     # router_forward now returns (depths, aux, probs) for STE; keep 2-tuple compat
     if len(router_out) == 3:
@@ -1342,22 +1350,25 @@ def forward(cfg, params, input_ids, training=False, attention_mask=None, return_
             aux = aux + block_aux / Nr
             aux_block_total = aux_block_total + block_aux
             continue
-        # training path: dense STE (gradient flows via m_soft)
+        # training path: dense STE (gradient flows via m_soft).
+        # Per-layer remat: recompute each layer on backward (see above).
         block_aux = 0.0
         for i, lt in enumerate(cfg.layer_types):
-            h, laux = mor_layer(cfg, params["block"][i], h, lt,
-                                 token_mask=m, attention_mask=attention_mask,
-                                 training=training)
+            h, laux = _ckpt_mor(cfg, params["block"][i], h, lt,
+                                m, attention_mask, True)
             block_aux = block_aux + laux
         aux = aux + block_aux / Nr
         aux_block_total = aux_block_total + block_aux
         # token-wise gating uses same STE mask (hard forward, soft backward)
         h = m[..., None] * h + (1.0 - m[..., None]) * h_prev
 
-    # last layer (MoE only)
+    # last layer (MoE only, rematted like the rest on the training path)
     residual = h
     h = rmsnorm(h, params["last"]["norm"], cfg.rms_norm_eps)
-    moe_out, a_last = moe_forward(cfg, params["last"]["moe"], h, training)
+    if training:
+        moe_out, a_last = _ckpt_moe(cfg, params["last"]["moe"], h, True)
+    else:
+        moe_out, a_last = moe_forward(cfg, params["last"]["moe"], h, training)
     h = residual + moe_out
     aux = aux + a_last
     aux_last = a_last

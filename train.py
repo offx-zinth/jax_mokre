@@ -485,6 +485,34 @@ def main():
         os.makedirs("/tmp/jax_cache", exist_ok=True)
 
     devices = jax.devices()
+    # Single-process guard (defense in depth; the notebook also lockfiles):
+    # refuse to train if another live `python -m jax_mokre.train` exists on
+    # this VM, since concurrent trains contend for the same TPU HBM.
+    try:
+        import subprocess as _ps_sub
+        _me = os.getpid()
+        _ps = _ps_sub.run(["ps", "-eo", "pid,args"], capture_output=True,
+                          text=True, timeout=10).stdout
+        for _line in _ps.splitlines()[1:]:
+            _parts = _line.split(None, 1)
+            if len(_parts) != 2:
+                continue
+            try:
+                _pid = int(_parts[0])
+            except ValueError:
+                continue
+            _toks = _parts[1].split()
+            if (_pid != _me and "-m" in _toks
+                    and any("jax_mokre" in t for t in _toks)):
+                try:
+                    os.kill(_pid, 0)
+                except OSError:
+                    continue  # stale ps entry
+                print(f"  [guard] another jax_mokre.train alive (pid={_pid}) — "
+                      f"exiting to avoid TPU contention", flush=True)
+                return
+    except Exception as _e:
+        print(f"  [guard] sibling check skipped ({_e})", flush=True)
     # FSDP/pjit handles data sharding itself — don't also pmap-reshape when mesh is set
     dist = len(devices) > 1 and not getattr(args, "mesh", None)
     if getattr(args, "mesh", None):
