@@ -884,10 +884,29 @@ def main():
             t0 = time.time()
             t0_steps = step
 
-        if step >= 80000 and step % args.ckpt_every == 0:
+        if step % args.ckpt_every == 0:
             save_state(os.path.join(args.out_dir, f"ckpt_{step}.pkl"), cfg,
                        params,
                        opt_state, step, rng)
+            # rotation: each ckpt is ~3-4GB (params+Adam); keep newest 2 so a
+            # 218k-step run with ckpt_every=1400 (~156 ckpts) can't fill disk.
+            try:
+                import glob as _g2
+                import re as _re2
+                def _cs(_p):
+                    _m = _re2.search(r"ckpt_(\d+)\.pkl", _p)
+                    return int(_m.group(1)) if _m else -1
+                _all = sorted(_g2.glob(os.path.join(args.out_dir, "ckpt_*.pkl")),
+                              key=_cs)
+                for _old in _all[:-2]:
+                    try:
+                        os.remove(_old)
+                        print(f"  [ckpt] rotated out {os.path.basename(_old)}",
+                              flush=True)
+                    except OSError:
+                        pass
+            except Exception as _e:
+                print(f"  [ckpt] rotation skipped ({_e})", flush=True)
 
         if step % args.gen_every == 0:
             sample(step)
