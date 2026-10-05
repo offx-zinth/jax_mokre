@@ -774,6 +774,7 @@ def main():
     losses = []
     last_good = (params, opt_state)
     t0 = time.time()
+    t0_steps = step  # micro-steps done at last log line (for honest tok/s)
 
     def log(step_, loss, aux, lr_, tok_per_s, breakdown=None):
         line = f"step={step_} loss={float(loss):.4f} aux={float(aux):.5f} lr={lr_:.2e} tok/s={tok_per_s:.0f}"
@@ -869,7 +870,8 @@ def main():
         step += 1
 
         if step % args.log_every == 0 or step == start_step + 1:
-            tok_per_s = step_tokens / max(time.time() - t0, 1e-6)
+            # t0 may span several steps: count exact micro-steps since last log
+            tok_per_s = step_tokens * max(step - t0_steps, 1) / max(time.time() - t0, 1e-6)
             breakdown = None
             # H2: decomposed aux logging (only single-device to avoid pmap overhead)
             if not dist:
@@ -880,6 +882,7 @@ def main():
             log(step, loss_v, float(np.asarray(aux).mean()),
                 lr, tok_per_s, breakdown)
             t0 = time.time()
+            t0_steps = step
 
         if step >= 80000 and step % args.ckpt_every == 0:
             save_state(os.path.join(args.out_dir, f"ckpt_{step}.pkl"), cfg,
