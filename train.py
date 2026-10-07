@@ -471,6 +471,16 @@ def main():
                      help="comma list of layer indices for Engram (e.g. '2' for MSA recursion layer, '1,2'); default None→global, default when --engram is '2'")
     args = ap.parse_args()
 
+    # Boot fingerprint: proves from inside how many trainers are alive, when
+    # each booted, and who launched it (parent pid). Printed FIRST so it shows
+    # even if a TPU race kills this process seconds later.
+    import uuid as _uuid
+    import time as _btime
+    _boot_id = _uuid.uuid4().hex[:8]
+    print(f"  [boot] id={_boot_id} pid={os.getpid()} ppid={os.getppid()} "
+          f"t={_btime.strftime('%H:%M:%S')} argv={' '.join(__import__('sys').argv[:6])}",
+          flush=True)
+
     os.makedirs(args.out_dir, exist_ok=True)
     log_path = os.path.join(args.out_dir, "train.log")
 
@@ -511,6 +521,8 @@ def main():
                 print(f"  [guard] another jax_mokre.train alive (pid={_pid}) — "
                       f"exiting to avoid TPU contention", flush=True)
                 return
+        print(f"  [guard] no sibling trainer (self pid={_me}) — proceeding",
+              flush=True)
     except Exception as _e:
         print(f"  [guard] sibling check skipped ({_e})", flush=True)
     # FSDP/pjit handles data sharding itself — don't also pmap-reshape when mesh is set
